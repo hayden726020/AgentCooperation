@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -150,6 +152,27 @@ def test_target_existing_tests_are_included(harness):
     new = root / "test_new.py"
     new.write_text("def test_new(): assert True\n")
     assert "tests" in harness.core._test_paths(root, [str(new)])
+
+
+def test_existing_suffix_tests_are_included(harness):
+    root = harness.core.repo_root / "workspace"
+    (root / "existing_test.py").write_text("def test_old(): assert False\n")
+    assert "existing_test.py" in harness.core._test_paths(root, [])
+
+
+def test_source_context_rejects_directory_links(tmp_path):
+    target = tmp_path / "task"
+    outside = tmp_path / "outside"
+    target.mkdir()
+    outside.mkdir()
+    (outside / "private.json").write_text('{"synthetic_private_marker": true}')
+    link = target / "alias"
+    if os.name == "nt":
+        subprocess.run(["cmd", "/d", "/c", "mklink", "/J", str(link), str(outside)],
+                       check=True, capture_output=True)
+    else:
+        link.symlink_to(outside, target_is_directory=True)
+    assert "synthetic_private_marker" not in core_module.OrchestratorCore._project_context(target)
 
 
 @pytest.mark.asyncio

@@ -34,3 +34,11 @@ def test_select_deepseek_as_primary():
 
     with pytest.raises(RuntimeError):
         enforcer.get_primary_agent("glm", mock_mode=True)
+def test_generic_key_and_endpoint_from_settings_are_used(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "glm_api_key", None)
+    monkeypatch.setattr(settings, "flash_api_key", "synthetic-test-key")
+    monkeypatch.setattr(settings, "flash_base_url", "https://synthetic.invalid/v1")
+    agent = SingleEngineSlotEnforcer(PolicyConfig()).get_primary_agent("glm", mock_mode=True)
+    assert agent.api_key == "synthetic-test-key"
+    assert agent.base_url == "https://synthetic.invalid/v1"

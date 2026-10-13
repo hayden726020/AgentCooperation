@@ -20,6 +20,7 @@ def test_cli_accepts_target_repository(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "execute_task", execute)
     assert cli.main() == 0
     assert execute.call_args.kwargs["repo_root"] == tmp_path
+    assert execute.call_args.args[1] is None
 
 
 def test_mock_core_database_is_separate(monkeypatch, tmp_path):
