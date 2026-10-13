@@ -26,8 +26,8 @@ def test_unknown_reviewer_configuration_is_rejected():
 
 def test_default_reviewer_uses_available_subscription_route():
     from config.settings import settings
-    assert PolicyConfig().reviewer_agent == "codex_cli"
-    assert settings.load_policy().reviewer_agent == "codex_cli"
+    assert PolicyConfig().reviewer_agent == "antigravity_cli"
+    assert settings.load_policy().reviewer_agent == "antigravity_cli"
 
 
 @pytest.mark.asyncio
