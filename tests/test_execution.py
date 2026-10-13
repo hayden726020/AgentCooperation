@@ -1,5 +1,4 @@
 import asyncio
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -87,6 +86,13 @@ async def test_zero_pytest_tests_cannot_pass(tmp_path, monkeypatch):
     assert outcome.total_tests == 0
 
 
+@pytest.mark.asyncio
+async def test_custom_unittest_command_with_zero_tests_cannot_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr("execution.test_runner.run_async_command", AsyncMock(return_value=result(stdout="Ran 0 tests in 0.000s\nOK")))
+    outcome = await Runner(tmp_path, custom_test_argv=[sys.executable, "-m", "unittest"]).run()
+    assert not outcome.passed
+
+
 def test_explicit_target_tests_do_not_collect_scheduler_tests(tmp_path):
     (tmp_path / "tests").mkdir()
     (tmp_path / "test_solution.py").write_text("", encoding="utf-8")
@@ -117,6 +123,58 @@ async def test_timeout_stops_process_promptly():
 
 
 @pytest.mark.asyncio
+async def test_cancellation_reaps_process(tmp_path):
+    import psutil
+
+    pid_path = tmp_path / "child.pid"
+    code = "import os,pathlib,time;pathlib.Path(os.environ['PID_PATH']).write_text(str(os.getpid()));time.sleep(30)"
+    task = asyncio.create_task(run_async_command([sys.executable, "-c", code], env={"PID_PATH": str(pid_path)}))
+    async def wait_for_pid():
+        while not pid_path.exists():
+            await asyncio.sleep(.01)
+    await asyncio.wait_for(wait_for_pid(), timeout=5)
+    pid = int(pid_path.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert not psutil.pid_exists(pid)
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_cannot_return_successful_sha(tmp_path, monkeypatch):
+    manager = WorktreeManager(tmp_path)
+    path = tmp_path / ".worktrees" / "safe"
+    monkeypatch.setattr(manager, "_validate_worktree", AsyncMock(return_value=path))
+    async def fake_git(cmd, **kwargs):
+        if cmd[1] == "diff":
+            return result(1)
+        if cmd[1] == "commit":
+            return result(1, stderr="commit failed")
+        return result(stdout="old-head")
+    monkeypatch.setattr("execution.worktree.run_async_command", AsyncMock(side_effect=fake_git))
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await manager.commit_checkpoint(path, "checkpoint")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_is_reported(monkeypatch):
+    def cannot_kill(pid):
+        raise RuntimeError("cleanup denied")
+    # A short-lived process avoids leaving a child running after the intentionally failed cleanup.
+    monkeypatch.setattr("execution.subproc.kill_process_tree", cannot_kill)
+    with pytest.raises(RuntimeError, match="cleanup denied"):
+        await run_async_command([sys.executable, "-c", "import time;time.sleep(.1)"], timeout=.01)
+
+
+@pytest.mark.asyncio
+async def test_windows_custom_command_quotes_execute(tmp_path):
+    command = subprocess.list2cmdline([sys.executable, "-c", "print('quoted command succeeded')"])
+    outcome = await Runner(tmp_path, custom_test_cmd=command).run()
+    assert outcome.passed
+    assert "quoted command succeeded" in outcome.raw_output
+
+
+@pytest.mark.asyncio
 async def test_real_git_worktree_checkpoints_and_fixed_diff(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -137,3 +195,31 @@ async def test_real_git_worktree_checkpoints_and_fixed_diff(tmp_path):
     assert "new.txt" in await manager.get_diff(worktree, base)
     await manager.cleanup_worktree("safe")
     assert not worktree.exists()
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ["1 skipped", "2 xfailed", "1 skipped, 1 xfailed"])
+async def test_pytest_without_successful_tests_is_not_passed(tmp_path, monkeypatch, summary):
+    import execution.test_runner as module
+    from execution.subproc import SubprocResult
+    (tmp_path / "test_empty.py").write_text("# target\n", encoding="utf-8")
+    async def command(cmd, **kwargs):
+        return SubprocResult(cmd, 0, summary, "", 0)
+    monkeypatch.setattr(module, "run_async_command", command)
+    result = await module.TestRunner(tmp_path).run()
+    assert not result.passed
+
+
+@pytest.mark.asyncio
+async def test_unittest_all_skipped_is_not_passed(tmp_path, monkeypatch):
+    import execution.test_runner as module
+    from execution.subproc import SubprocResult
+    async def command(cmd, **kwargs):
+        return SubprocResult(cmd, 0, "Ran 2 tests in 0.001s\nOK (skipped=2)", "", 0)
+    monkeypatch.setattr(module, "run_async_command", command)
+    assert not (await module.TestRunner(tmp_path, custom_test_argv=["python", "-m", "unittest"]).run()).passed
+
+
+def test_default_target_includes_existing_tests_directory(tmp_path):
+    from execution.test_runner import TestRunner
+    (tmp_path / "test_new.py").write_text("# target\n")
+    (tmp_path / "tests").mkdir()
+    assert "tests" in TestRunner(tmp_path).detect_command()

@@ -140,6 +140,16 @@ async def test_disabled_codex_is_not_called(harness):
     harness.runner.outcomes = [False]
     assert (await run(harness)).state != "SUCCESS"
     harness.expert.execute.assert_not_awaited()
+    assert harness.core.codex_guard.state == "READY"
+
+
+def test_target_existing_tests_are_included(harness):
+    root = harness.core.repo_root / "workspace"
+    (root / "tests").mkdir()
+    (root / "tests" / "test_existing.py").write_text("def test_existing(): assert True\n")
+    new = root / "test_new.py"
+    new.write_text("def test_new(): assert True\n")
+    assert "tests" in harness.core._test_paths(root, [str(new)])
 
 
 @pytest.mark.asyncio
