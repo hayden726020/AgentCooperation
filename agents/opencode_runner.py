@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional
 from agents.base import BaseAgent, AgentResult, redact_credentials, task_directory
 from execution.subproc import run_async_command, SubprocResult
 from config.settings import settings
+from execution.cli_launcher import build_cli_argv
 
 
 class OpenCodeRunner(BaseAgent):
@@ -16,11 +17,16 @@ class OpenCodeRunner(BaseAgent):
         self,
         model_name: str,
         agent_type: str = "build",  # "build" 或 "plan"
-        cli_cmd: Optional[str] = None
+        cli_cmd: Optional[str] = None,
+        cli_argv_prefix: list[str] | None = None,
     ):
         super().__init__(role_name="OPENCODE_RUNNER", model_name=model_name)
         self.agent_type = agent_type
         self.cli_cmd = cli_cmd or settings.opencode_cli_cmd
+        self.cli_argv_prefix = (
+            cli_argv_prefix if cli_argv_prefix is not None
+            else settings.opencode_cli_argv_prefix if cli_cmd is None else []
+        )
 
     def _provider_credentials(self) -> dict[str, str]:
         """Pass only the explicitly selected provider's API credential."""
@@ -38,16 +44,11 @@ class OpenCodeRunner(BaseAgent):
         context = context or {}
         credential_env: dict[str, str] = {}
 
-        cmd = [
-            self.cli_cmd,
-            "run",
-            "--model", self.model_name,
-            "--agent", self.agent_type,
-            prompt
-        ]
-
         try:
             worktree_path = task_directory(context)
+            cmd = build_cli_argv(self.cli_cmd, self.cli_argv_prefix) + [
+                "run", "--model", self.model_name, "--agent", self.agent_type, prompt,
+            ]
             credential_env = self._provider_credentials()
             res: SubprocResult = await run_async_command(
                 cmd=cmd,

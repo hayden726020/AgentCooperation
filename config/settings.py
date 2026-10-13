@@ -87,6 +87,9 @@ class AppSettings(BaseSettings):
     gemini_cli_cmd: str = "gemini"
     codex_cli_cmd: str = "codex"
     opencode_cli_cmd: str = "opencode"
+    gemini_cli_argv_prefix: List[str] = Field(default_factory=list)
+    codex_cli_argv_prefix: List[str] = Field(default_factory=list)
+    opencode_cli_argv_prefix: List[str] = Field(default_factory=list)
 
     # SQLite Database
     sqlite_db_path: str = "data/agent_orchestrator.db"

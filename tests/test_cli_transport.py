@@ -164,6 +164,31 @@ async def test_gemini_uses_explicit_prefix_and_stdin_context(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_gemini_all_prefixes_use_fixed_absolute_review_policy(monkeypatch, tmp_path):
+    policy = tmp_path / "fixed review policy.toml"
+    policy.write_text('[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\n', encoding="utf-8")
+    monkeypatch.setattr("agents.gemini_reviewer.REVIEW_POLICY_PATH", policy, raising=False)
+    command = AsyncMock(return_value=SubprocResult(["fixture"], 0, review_output(), "", 0))
+    monkeypatch.setattr("agents.gemini_reviewer.run_async_command", command)
+    answer = await GeminiReviewer(cli_argv_prefix=[sys.executable, "trusted-wrapper.py"]).execute(
+        "fixture", {"worktree_path": tmp_path},
+    )
+    assert answer.success
+    argv = command.call_args.args[0]
+    assert argv[argv.index("--policy") + 1] == str(policy.resolve())
+
+
+@pytest.mark.asyncio
+async def test_gemini_missing_review_policy_fails_before_any_model_call(monkeypatch, tmp_path):
+    monkeypatch.setattr("agents.gemini_reviewer.REVIEW_POLICY_PATH", tmp_path / "missing.toml", raising=False)
+    command = AsyncMock(return_value=SubprocResult(["fixture"], 0, review_output(), "", 0))
+    monkeypatch.setattr("agents.gemini_reviewer.run_async_command", command)
+    answer = await GeminiReviewer().execute("fixture", {"worktree_path": tmp_path})
+    assert not answer.success and "policy" in answer.error.lower()
+    command.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_codex_preserves_subscription_home_and_passes_prompt_on_stdin(monkeypatch, tmp_path):
     prefix = [sys.executable, str(tmp_path / "codex wrapper.py")]
     monkeypatch.setitem(settings.__dict__, "codex_cli_argv_prefix", prefix)

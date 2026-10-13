@@ -254,7 +254,7 @@ async def test_review_contains_original_requirement(monkeypatch, tmp_path):
     monkeypatch.setattr("agents.gemini_reviewer.run_async_command", command)
     requirement = "Implement the full fixture request with persistent state"
     await GeminiReviewer().execute("Review changes", {"worktree_path": tmp_path, "requirement": requirement})
-    assert requirement in command.call_args.args[0][2]
+    assert requirement in command.call_args.kwargs["input_text"]
 
 
 @pytest.mark.asyncio

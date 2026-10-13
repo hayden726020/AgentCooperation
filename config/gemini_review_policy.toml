@@ -1,0 +1,6 @@
+# The reviewer receives its evidence on stdin and must never execute tools.
+# This also prevents headless Plan Mode from exiting into automatic execution.
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 999

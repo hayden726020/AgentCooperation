@@ -1,3 +1,4 @@
+import os
 import re
 import time
 from pathlib import Path
@@ -5,6 +6,7 @@ from typing import Any
 from agents.base import BaseAgent, AgentResult, parse_review_output, task_directory
 from agents.gemini_reviewer import REVIEW_SCHEMA_PROMPT
 from execution.subproc import run_async_command, SubprocResult
+from execution.cli_launcher import build_cli_argv
 from config.settings import settings
 
 
@@ -30,10 +32,15 @@ class CodexExpert(BaseAgent):
         self,
         cli_cmd: str | None = None,
         mock_mode: bool = False,
-        simulate_exhausted: bool = False
+        simulate_exhausted: bool = False,
+        cli_argv_prefix: list[str] | None = None,
     ):
         super().__init__(role_name="SENIOR_EXPERT", model_name="Codex-CLI")
         self.cli_cmd = cli_cmd or settings.codex_cli_cmd
+        self.cli_argv_prefix = (
+            cli_argv_prefix if cli_argv_prefix is not None
+            else settings.codex_cli_argv_prefix if cli_cmd is None else []
+        )
         self.mock_mode = mock_mode
         self.simulate_exhausted = simulate_exhausted
 
@@ -90,8 +97,14 @@ class CodexExpert(BaseAgent):
             await self._verify_expected_head(cwd, context)
             if context.get("structured_review"):
                 full_prompt += f"\n{REVIEW_SCHEMA_PROMPT}"
-            cmd = [self.cli_cmd, "exec", "--sandbox", "read-only", full_prompt]
-            res: SubprocResult = await run_async_command(cmd, cwd=cwd, timeout=300.0)
+            cmd = build_cli_argv(self.cli_cmd, self.cli_argv_prefix) + [
+                "exec", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-",
+            ]
+            auth_home = os.getenv("CODEX_HOME")
+            credential_env = {"CODEX_HOME": auth_home} if auth_home else {}
+            res: SubprocResult = await run_async_command(
+                cmd, cwd=cwd, env=credential_env, timeout=300.0, input_text=full_prompt,
+            )
             duration = time.monotonic() - start_time
             combined_output = f"{res.stdout}\n{res.stderr}"
 
