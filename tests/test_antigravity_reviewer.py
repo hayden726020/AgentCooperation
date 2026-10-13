@@ -2,6 +2,7 @@
 
 import importlib
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -24,8 +25,11 @@ def verdict():
             "critical_issues": [], "suggestions": []}
 
 
-def output(result, model="gemini-3.8-flash-medium"):
-    return json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": model}}) + "\n" + json.dumps({"event": "result", "result": result}) + "\n"
+def output(result, model="gemini-3.8-flash-low", cwd=None, tools=None):
+    initialization = {"agent": "orchestrator-readonly-reviewer", "tools": tools or [], "model": model}
+    if cwd is not None:
+        initialization["cwd"] = str(cwd)
+    return json.dumps({"event": "init", "init": initialization}) + "\n" + json.dumps({"event": "result", "result": result}) + "\n"
 
 
 def test_structured_success_envelope_is_validated():
@@ -111,8 +115,19 @@ async def test_review_uses_isolated_tool_free_agent_and_ndjson_stdin(monkeypatch
         assert command[command.index("--agent") + 1] == profile["name"]
         assert "--disable-slash-commands" in command
         assert "--dangerously-skip-permissions" not in command
-        assert kwargs["env"] == {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
-        return SubprocResult(command, 0, output({"status": "SUCCESS", "structured_output": verdict()}), "", 0)
+        environment = kwargs["env"]
+        assert environment["AGY_CLI_DISABLE_AUTO_UPDATE"] == "true"
+        assert environment["HOME"] == environment["USERPROFILE"]
+        home = Path(environment["HOME"])
+        assert home != root and home != tmp_path
+        policy = json.loads((home / ".gemini/antigravity-cli/settings.json").read_text(encoding="utf-8"))
+        assert policy["permissions"]["allow"] == [] and policy["permissions"]["ask"] == []
+        assert set(policy["permissions"]["deny"]) == {
+            "read_file(*)", "write_file(*)", "command(*)", "unsandboxed(*)",
+            "read_url(*)", "execute_url(*)", "mcp(*)",
+        }
+        return SubprocResult(command, 0, output({"status": "SUCCESS", "structured_output": verdict()},
+                            cwd=root, tools=["write_to_file", "run_command"]), "", 0)
 
     monkeypatch.setattr(module, "run_async_command", cli)
     result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
@@ -156,3 +171,28 @@ async def test_model_mismatch_cannot_approve(monkeypatch, tmp_path):
         "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40},
     )
     assert not result.success and "model" in result.error
+
+
+@pytest.mark.asyncio
+async def test_changed_permission_profile_cannot_approve(monkeypatch, tmp_path):
+    module = adapter()
+    monkeypatch.setattr(module.CodexExpert, "_verify_expected_head", AsyncMock())
+
+    async def cli(command, **kwargs):
+        policy = Path(kwargs["env"]["HOME"]) / ".gemini/antigravity-cli/settings.json"
+        policy.write_text('{}', encoding="utf-8")
+        return SubprocResult(command, 0, output({"status": "SUCCESS", "structured_output": verdict()},
+                            cwd=kwargs["cwd"], tools=["write_to_file"]), "", 0)
+
+    monkeypatch.setattr(module, "run_async_command", cli)
+    result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
+        "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40,
+                   "deny_policy_verified": True},
+    )
+    assert not result.success and "policy" in result.error
+
+
+def test_standalone_parser_rejects_full_tool_registry_without_policy_proof():
+    raw = output({"status": "SUCCESS", "structured_output": verdict()}, tools=["write_to_file"])
+    with pytest.raises(ValueError):
+        adapter().parse_antigravity_review(raw)
