@@ -1,0 +1,52 @@
+agents:
+  primary: "glm"          # 默认主力："glm" 或 "deepseek"（互斥二选一）
+  reviewer: "gemini_cli"  # 独立复核（本地订阅 CLI）
+  expert: "codex_cli"     # 架构/难题专家（本地订阅 CLI）
+
+models:
+  glm:
+    model_id: "glm-5.3-flash"
+    base_url: "https://open.bigmodel.cn/api/paas/v4"
+    input_price_per_m_usd: 0.15
+    output_price_per_m_usd: 0.50
+  deepseek:
+    model_id: "deepseek-flash"
+    base_url: "https://api.deepseek.com/v1"
+    input_price_per_m_usd: 0.15
+    output_price_per_m_usd: 0.60
+
+budget:
+  monthly_cny: 200.0
+  warning_cny: 160.0
+  pause_new_cny: 190.0
+  hard_stop_cny: 200.0
+  task_limit_cny: 10.0
+  usd_to_cny_rate: 7.25
+
+codex:
+  enabled: true
+  min_severity: "P1"
+  max_calls_per_task: 2
+  triggers:
+    - repeated_failure_3
+    - architecture_conflict
+    - severe_performance_issue
+    - security_issue
+  on_weekly_limit:
+    state: "EXHAUSTED"
+    action: "save_pending_review"
+    fallback:
+      - "gemini_cli"
+    resume_eligible_work: true
+  on_quota_recovered:
+    action: "recheck_pending_reviews"
+    priority: "oldest_important_first"
+
+repair:
+  max_normal_attempts: 3
+  verify_with_tests: true
+  save_git_checkpoint: true
+
+execution:
+  timeout_seconds: 600
+  git_worktree_base: ".worktrees"
