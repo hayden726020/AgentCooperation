@@ -9,7 +9,7 @@ import orchestrator.core as core_module
 from agents.base import AgentResult
 from agents.codex_expert import CodexQuotaExhaustedError
 from execution.test_runner import TestResult as RunResult
-from storage.models import PendingCodexAudit, Task
+from storage.models import PendingCodexAudit, PendingAuditContext, Task
 
 
 @pytest.fixture
@@ -45,7 +45,7 @@ def harness(tmp_path, monkeypatch):
         passed = runner.outcomes[idx]
         runner.calls += 1
         return RunResult(passed, 1, 0 if passed else 1,
-                         "1 passed" if passed else "1 failed", "failure evidence", 0.01)
+                         "1 passed" if passed else "1 failed", "1 passed" if passed else "1 failed", 0.01)
 
     runner.run = test_run
     monkeypatch.setattr(core_module, "TestRunner", lambda *args, **kwargs: runner)
@@ -167,3 +167,18 @@ async def test_workspace_setup_failure_is_persisted(harness):
     assert task.state == "FAILED"
     assert "worktree denied" in task.result_summary
     assert harness.session.exec(select(Task)).one().state == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_fallback_audit_binds_final_commit_and_validation(harness):
+    harness.runner.outcomes = [False, False, False, False, True]
+    harness.expert.execute.side_effect = CodexQuotaExhaustedError("weekly usage limit")
+    harness.core.worktree_mgr.commit_checkpoint.side_effect = [letter * 40 for letter in "bcdef"]
+    task = await run(harness)
+    assert task.state == "SUCCESS"
+    assert task.has_pending_codex_audit
+    audit = harness.session.exec(select(PendingCodexAudit)).one()
+    evidence = harness.session.exec(select(PendingAuditContext)).one()
+    assert audit.commit_sha == "f" * 40
+    assert evidence.test_summary == "1 passed"
+    assert '"approved": true' in audit.gemini_review_json
