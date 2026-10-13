@@ -121,6 +121,7 @@ async def test_review_uses_isolated_tool_free_agent_and_ndjson_stdin(monkeypatch
         home = Path(environment["HOME"])
         assert home != root and home != tmp_path
         policy = json.loads((home / ".gemini/antigravity-cli/settings.json").read_text(encoding="utf-8"))
+        assert set(policy) == {"permissions"}
         assert policy["permissions"]["allow"] == [] and policy["permissions"]["ask"] == []
         assert set(policy["permissions"]["deny"]) == {
             "read_file(*)", "write_file(*)", "command(*)", "unsandboxed(*)",
@@ -207,8 +208,8 @@ def test_deny_policy_verification_accepts_equivalent_cli_serialization(tmp_path,
     rewritten["permissions"]["deny"].reverse()
     rewritten["selectedModel"] = "gemini-3.8-flash-low"
     if sparse:
-        rewritten.pop("toolPermission")
-        rewritten.pop("allowNonWorkspaceAccess")
+        rewritten.pop("toolPermission", None)
+        rewritten.pop("allowNonWorkspaceAccess", None)
         rewritten["permissions"].pop("allow")
         rewritten["permissions"].pop("ask")
     path = tmp_path / "settings.json"
@@ -235,3 +236,22 @@ def test_deny_policy_verification_rejects_permission_weakening(tmp_path, mutatio
     path.write_text(json.dumps(changed), encoding="utf-8")
     with pytest.raises(ValueError):
         module._verify_deny_policy(path, expected)
+
+
+@pytest.mark.asyncio
+async def test_native_deny_only_policy_persistence_can_approve(monkeypatch, tmp_path):
+    module = adapter()
+    monkeypatch.setattr(module.CodexExpert, "_verify_expected_head", AsyncMock())
+
+    async def cli(command, **kwargs):
+        path = Path(kwargs["env"]["HOME"]) / ".gemini/antigravity-cli/settings.json"
+        current = json.loads(path.read_text(encoding="utf-8"))
+        path.write_text(json.dumps({"permissions": {"deny": current["permissions"]["deny"]}}, indent=2), encoding="utf-8")
+        return SubprocResult(command, 0, output({"status": "SUCCESS", "structured_output": verdict()},
+                            cwd=kwargs["cwd"], tools=["write_to_file", "run_command"]), "", 0)
+
+    monkeypatch.setattr(module, "run_async_command", cli)
+    result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
+        "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40},
+    )
+    assert result.success, result.error
