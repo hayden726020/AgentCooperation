@@ -1,13 +1,15 @@
 import re
 import time
-from typing import Dict, Any, Optional
-from agents.base import BaseAgent, AgentResult
+from pathlib import Path
+from typing import Any
+from agents.base import BaseAgent, AgentResult, parse_review_output, task_directory
+from agents.gemini_reviewer import REVIEW_SCHEMA_PROMPT
 from execution.subproc import run_async_command, SubprocResult
 from config.settings import settings
 
 
 class CodexQuotaExhaustedError(Exception):
-    """当 Codex 本地 CLI 遇到周额度耗尽、速率限制或配额不足时抛出"""
+    """Codex explicitly reports its subscription usage or weekly allowance exhausted."""
     pass
 
 
@@ -19,20 +21,14 @@ class CodexExpert(BaseAgent):
     """
 
     EXHAUSTION_PATTERNS = [
-        r"quota\s*exceeded",
-        r"rate\s*limit",
-        r"weekly\s*limit",
-        r"usage\s*cap",
-        r"insufficient_quota",
-        r"status\s*429",
-        r"out of quota",
-        r"额度已耗尽",
-        r"访问频率超限"
+        r"\b(?:hit|reached|exceeded|exhausted)\b[^\n]{0,50}\b(?:usage\s+(?:limit|cap)|weekly\s+(?:usage\s+)?(?:limit|quota))\b",
+        r"\b(?:usage\s+(?:limit|cap)|weekly\s+(?:usage\s+)?(?:limit|quota))\b[^\n]{0,50}\b(?:exhausted|exceeded|reached)\b",
+        r"(?:周|每周)(?:使用)?(?:额度|限额).{0,12}(?:已耗尽|用完|超出)",
     ]
 
     def __init__(
         self,
-        cli_cmd: Optional[str] = None,
+        cli_cmd: str | None = None,
         mock_mode: bool = False,
         simulate_exhausted: bool = False
     ):
@@ -42,56 +38,70 @@ class CodexExpert(BaseAgent):
         self.simulate_exhausted = simulate_exhausted
 
     def check_is_quota_exhausted(self, text: str) -> bool:
+        """Distinguish an explicit usage allowance failure from transient rate limits."""
         lowered = text.lower()
-        for pat in self.EXHAUSTION_PATTERNS:
-            if re.search(pat, lowered):
-                return True
-        return False
+        return any(re.search(pattern, lowered) for pattern in self.EXHAUSTION_PATTERNS)
 
-    async def execute(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
-        start_time = time.time()
+    @staticmethod
+    def _mock_result(context: dict[str, Any]) -> AgentResult:
+        metadata: dict[str, Any] = {"mock": True}
+        if context.get("structured_review"):
+            metadata["review"] = {
+                "approved": True, "severity": "P3", "summary": "Explicit simulated audit",
+                "critical_issues": [], "suggestions": [],
+            }
+        return AgentResult(
+            success=True,
+            content="[Mock Codex Senior Advisor] Add validated guard clauses and verify with tests.",
+            metadata=metadata,
+        )
+
+    @staticmethod
+    async def _verify_expected_head(cwd: Path, context: dict[str, Any]) -> None:
+        """Bind backlog audits to the full recorded commit before invoking a model."""
+        expected = context.get("expected_commit_sha")
+        if expected is None:
+            return
+        if not isinstance(expected, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected):
+            raise ValueError("expected_commit_sha must be a full Git commit SHA")
+        head = await run_async_command(["git", "rev-parse", "HEAD"], cwd=cwd, timeout=15.0)
+        if not head.is_success or head.stdout.strip().casefold() != expected.casefold():
+            raise ValueError("Task HEAD does not match the commit recorded for this audit")
+        status = await run_async_command(
+            ["git", "status", "--porcelain", "--untracked-files=all"], cwd=cwd, timeout=15.0
+        )
+        if not status.is_success:
+            raise ValueError("Cannot verify whether the recorded audit checkout is clean")
+        if status.stdout.strip():
+            raise ValueError("Recorded audit checkout has uncommitted or untracked changes")
+
+    async def execute(self, prompt: str, context: dict[str, Any] | None = None) -> AgentResult:
+        """Provide advice or a structured audit without modifying the task checkout."""
+        start_time = time.monotonic()
         context = context or {}
-        issue_context = context.get("issue_context", "")
-
         if self.simulate_exhausted:
             raise CodexQuotaExhaustedError("Codex weekly quota exhausted (simulated limit reached).")
-
         if self.mock_mode:
-            duration = 0.5
-            expert_advice = (
-                "[Mock Codex Senior Advisor]\n"
-                "Architecture Decision & Patch Guide:\n"
-                "1. Root cause: The edge case was not accounted for during boundary validation.\n"
-                "2. Recommended fix: Implement robust guard clauses before state transitions.\n"
-                "3. Safe to proceed under Gemini supervision."
-            )
-            return AgentResult(
-                success=True,
-                content=expert_advice,
-                cost_cny=0.0,
-                duration_s=duration,
-                metadata={"mock": True}
-            )
-
+            return self._mock_result(context)
+        issue_context = context.get("issue_context", "")
         full_prompt = f"Expert Advice Required:\nContext: {issue_context}\nTask: {prompt}"
-        cmd = [self.cli_cmd, "exec", "--sandbox", "read-only", full_prompt]
-
         try:
-            res: SubprocResult = await run_async_command(cmd, timeout=300.0)
-            duration = time.time() - start_time
+            cwd = task_directory(context)
+            await self._verify_expected_head(cwd, context)
+            if context.get("structured_review"):
+                full_prompt += f"\n{REVIEW_SCHEMA_PROMPT}"
+            cmd = [self.cli_cmd, "exec", "--sandbox", "read-only", full_prompt]
+            res: SubprocResult = await run_async_command(cmd, cwd=cwd, timeout=300.0)
+            duration = time.monotonic() - start_time
             combined_output = f"{res.stdout}\n{res.stderr}"
 
             # 检测额度是否耗尽
-            if self.check_is_quota_exhausted(combined_output):
+            if not res.is_success and self.check_is_quota_exhausted(combined_output):
                 raise CodexQuotaExhaustedError(
                     f"Codex quota exhausted detected from CLI: {combined_output[:200]}"
                 )
 
             if not res.is_success:
-                # 检查退出码与报错中是否有额度耗尽特征
-                if self.check_is_quota_exhausted(res.stderr):
-                    raise CodexQuotaExhaustedError(f"Codex quota error: {res.stderr[:200]}")
-                
                 return AgentResult(
                     success=False,
                     content="",
@@ -99,18 +109,22 @@ class CodexExpert(BaseAgent):
                     error=f"Codex CLI failed (exit {res.exit_code}): {res.stderr[:300]}"
                 )
 
+            if not res.stdout.strip():
+                raise ValueError("Codex returned an empty response")
+            await self._verify_expected_head(cwd, context)
+            review = parse_review_output(res.stdout) if context.get("structured_review") else None
             return AgentResult(
                 success=True,
                 content=res.stdout,
                 cost_cny=0.0,
                 duration_s=duration,
-                metadata={"exit_code": res.exit_code}
+                metadata={"exit_code": res.exit_code, "mock": False, **({"review": review} if review else {})}
             )
 
         except CodexQuotaExhaustedError:
             raise
         except Exception as e:
-            duration = time.time() - start_time
+            duration = time.monotonic() - start_time
             return AgentResult(
                 success=False,
                 content="",

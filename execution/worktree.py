@@ -1,90 +1,107 @@
-import asyncio
+import re
 from pathlib import Path
-from typing import Optional
+
 from execution.subproc import run_async_command
 
 
 class WorktreeManager:
-    """
-    负责各任务独立 Git Worktree 环境隔离与版本检查点控制。
-    保证多任务互不干扰，支持自动回退破坏性修改。
-    """
+    """Manage verified task worktrees without modifying the source checkout."""
 
     def __init__(self, repo_root: Path, worktree_base_dir: str = ".worktrees"):
-        self.repo_root = repo_root
-        self.worktree_base = self.repo_root / worktree_base_dir
-        self.worktree_base.mkdir(parents=True, exist_ok=True)
+        self.repo_root = Path(repo_root).resolve()
+        self.worktree_base = (self.repo_root / worktree_base_dir).resolve()
+        if self.worktree_base == self.repo_root or not self.worktree_base.is_relative_to(self.repo_root):
+            raise ValueError("Worktree directory must be inside the repository")
 
-    async def ensure_repo_has_initial_commit(self):
-        """确保主仓库至少有一次提交，否则无法创建 worktree"""
-        check_head = await run_async_command(["git", "rev-parse", "--verify", "HEAD"], cwd=self.repo_root)
-        if not check_head.is_success:
-            await run_async_command(["git", "add", "."], cwd=self.repo_root)
-            await run_async_command(
-                ["git", "commit", "-m", "chore: initial commit for orchestrator"],
-                cwd=self.repo_root
-            )
+    @staticmethod
+    def _branch(task_id: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", task_id):
+            raise ValueError("Invalid task id")
+        return f"codex/task_{task_id}"
+
+    def _task_path(self, task_id: str) -> Path:
+        self._branch(task_id)
+        path = self.worktree_base / task_id
+        if path.resolve().parent != self.worktree_base:
+            raise ValueError("Worktree path escaped its task directory")
+        return path
+
+    async def _git(self, args: list[str], cwd: Path):
+        result = await run_async_command(["git", *args], cwd=cwd)
+        if not result.is_success:
+            raise RuntimeError(f"Git {args[0]} failed: {result.stderr.strip()}")
+        return result.stdout.strip()
+
+    async def _validate_worktree(self, worktree_path: Path) -> Path:
+        path = Path(worktree_path).resolve()
+        if path == self.repo_root or path.parent != self.worktree_base:
+            raise ValueError("Operation requires a task worktree inside the configured directory")
+        branch = self._branch(path.name)
+        marker = path / ".git"
+        if not marker.is_file():
+            raise ValueError("Task directory is not a linked Git worktree")
+        top = await self._git(["rev-parse", "--show-toplevel"], path)
+        actual_branch = await self._git(["branch", "--show-current"], path)
+        common = await self._git(["rev-parse", "--git-common-dir"], path)
+        source_common = await self._git(["rev-parse", "--git-common-dir"], self.repo_root)
+        if (Path(top).resolve() != path or actual_branch != branch
+                or (path / common).resolve() != (self.repo_root / source_common).resolve()):
+            raise ValueError("Task worktree does not belong to this repository and branch")
+        return path
+
+    async def ensure_repo_has_initial_commit(self) -> str:
+        """Require an existing commit; initializing a user's repository is explicit work."""
+        return await self._git(["rev-parse", "--verify", "HEAD"], self.repo_root)
 
     async def create_worktree(self, task_id: str) -> Path:
-        """为当前任务创建专用的 worktree 和新分支"""
-        await self.ensure_repo_has_initial_commit()
-        branch_name = f"task/{task_id}"
-        worktree_path = self.worktree_base / task_id
+        path = self._task_path(task_id)
+        branch = self._branch(task_id)
+        if path.exists():
+            await self._validate_worktree(path)
+            await self.get_base_ref(path)
+            return path
+        base = await self.ensure_repo_has_initial_commit()
+        self.worktree_base.mkdir(parents=True, exist_ok=True)
+        await self._git(["worktree", "add", "-b", branch, str(path), base], self.repo_root)
+        await self._validate_worktree(path)
+        await self._git(["config", f"branch.{branch}.orchestratorBase", base], path)
+        return path
 
-        if worktree_path.exists():
-            return worktree_path
+    async def get_base_ref(self, worktree_path: Path) -> str:
+        path = await self._validate_worktree(worktree_path)
+        base = await self._git(["config", "--get", f"branch.{self._branch(path.name)}.orchestratorBase"], path)
+        if not re.fullmatch(r"[a-fA-F0-9]{40,64}", base):
+            raise ValueError("Task worktree has no valid fixed base commit")
+        await self._git(["rev-parse", "--verify", f"{base}^{{commit}}"], path)
+        return base
 
-        # 尝试 git worktree add -b <branch> <path> HEAD
-        res = await run_async_command(
-            ["git", "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
-            cwd=self.repo_root
-        )
+    async def commit_checkpoint(self, worktree_path: Path, message: str) -> str:
+        path = await self._validate_worktree(worktree_path)
+        await self._git(["add", "-A"], path)
+        changed = await run_async_command(["git", "diff", "--cached", "--quiet"], cwd=path)
+        if changed.exit_code == 1 and not changed.timed_out:
+            await self._git(["commit", "-m", message], path)
+        elif not changed.is_success:
+            raise RuntimeError(f"Cannot inspect staged checkpoint: {changed.stderr}")
+        return await self._git(["rev-parse", "HEAD"], path)
 
-        if not res.is_success:
-            # 如果分支已存在，尝试不带 -b
-            res2 = await run_async_command(
-                ["git", "worktree", "add", str(worktree_path), branch_name],
-                cwd=self.repo_root
-            )
-            if not res2.is_success:
-                # 极端情况下如果 worktree 创建失败，直接回退为在 worktree_path 建立软拷贝目录
-                worktree_path.mkdir(parents=True, exist_ok=True)
-                return worktree_path
-
-        return worktree_path
-
-    async def commit_checkpoint(self, worktree_path: Path, message: str) -> Optional[str]:
-        """为当前任务进展创建 git commit 检查点"""
-        await run_async_command(["git", "add", "-A"], cwd=worktree_path)
-        commit_res = await run_async_command(
-            ["git", "commit", "-m", message],
-            cwd=worktree_path
-        )
-        # 获取当前 HEAD sha
-        sha_res = await run_async_command(["git", "rev-parse", "HEAD"], cwd=worktree_path)
-        if sha_res.is_success:
-            return sha_res.stdout.strip()
-        return None
-
-    async def get_diff(self, worktree_path: Path, base_ref: str = "HEAD~1") -> str:
-        """获取与基础版本的 Diff 文本"""
-        diff_res = await run_async_command(["git", "diff", base_ref], cwd=worktree_path)
-        if diff_res.is_success and diff_res.stdout.strip():
-            return diff_res.stdout.strip()
-        
-        # 如果 HEAD~1 不可用，获取当前已暂存/未暂存与 HEAD 的 diff
-        diff_head = await run_async_command(["git", "diff", "HEAD"], cwd=worktree_path)
-        return diff_head.stdout.strip()
+    async def get_diff(self, worktree_path: Path, base_ref: str | None = None) -> str:
+        path = await self._validate_worktree(worktree_path)
+        base = base_ref or await self.get_base_ref(path)
+        if not re.fullmatch(r"[a-fA-F0-9]{40,64}", base):
+            raise ValueError("Diff requires a fixed base commit SHA")
+        return await self._git(["diff", "--no-ext-diff", base, "--"], path)
 
     async def rollback(self, worktree_path: Path, target_sha: str) -> bool:
-        """将工作区硬回退到指定检查点"""
-        res = await run_async_command(["git", "reset", "--hard", target_sha], cwd=worktree_path)
-        return res.is_success
+        path = await self._validate_worktree(worktree_path)
+        if not re.fullmatch(r"[a-fA-F0-9]{40,64}", target_sha):
+            raise ValueError("Rollback requires a checkpoint commit SHA")
+        await self._git(["reset", "--hard", target_sha], path)
+        return True
 
     async def cleanup_worktree(self, task_id: str, force: bool = False):
-        """清理 worktree 释放磁盘空间"""
-        worktree_path = self.worktree_base / task_id
-        cmd = ["git", "worktree", "remove", str(worktree_path)]
+        path = await self._validate_worktree(self._task_path(task_id))
+        cmd = ["worktree", "remove"]
         if force:
             cmd.append("--force")
-        await run_async_command(cmd, cwd=self.repo_root)
+        await self._git([*cmd, str(path)], self.repo_root)

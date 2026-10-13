@@ -19,13 +19,15 @@ class TaskLifecycleFSM:
         "CODEX_BACKLOGGED",
         "SUCCESS",
         "FAILED",
-        "BUDGET_STOPPED"
+        "BUDGET_STOPPED", "WAITING_APPROVAL", "WAITING_REVIEW", "INTERRUPTED"
     ]
 
     def __init__(self, max_repair_attempts: int = 3, initial_state: str = "INIT"):
         self.max_repair_attempts = max_repair_attempts
         self.repair_attempts = 0
         self.escalation_count = 0
+        self.tests_passed = False
+        self.review_approved = False
 
         self.machine = Machine(
             model=self,
@@ -68,8 +70,7 @@ class TaskLifecycleFSM:
         self.machine.add_transition(
             trigger="to_escalating_from_test",
             source="TESTING",
-            dest="ESCALATING",
-            conditions=["exceeded_repair_limit"]
+            dest="ESCALATING"
         )
 
         # 6. 测试通过 -> 提交 Gemini CLI 独立复核
@@ -102,9 +103,15 @@ class TaskLifecycleFSM:
 
         # 10. 复核通过或专家升级处理完毕 -> 顺利完成
         self.machine.add_transition(
+            trigger="to_repairing_from_review", source="REVIEWING", dest="REPAIRING",
+            conditions=["can_repair"], after="increment_repair_attempts"
+        )
+        self.machine.add_transition(
+            trigger="to_repairing_from_backlog", source="CODEX_BACKLOGGED", dest="REPAIRING"
+        )
+        self.machine.add_transition(
             trigger="to_success",
-            source=["REVIEWING", "CODEX_BACKLOGGED", "ESCALATING"],
-            dest="SUCCESS"
+            source="REVIEWING", dest="SUCCESS", conditions=["verified_delivery"]
         )
 
 
@@ -119,10 +126,17 @@ class TaskLifecycleFSM:
             source=TaskLifecycleFSM.STATES,
             dest="BUDGET_STOPPED"
         )
+        for trigger, state in (("to_waiting_approval", "WAITING_APPROVAL"),
+                               ("to_waiting_review", "WAITING_REVIEW"),
+                               ("to_interrupted", "INTERRUPTED")):
+            self.machine.add_transition(trigger=trigger, source="*", dest=state)
 
     # --- Guards ---
     def can_repair(self) -> bool:
         return self.repair_attempts < self.max_repair_attempts
+
+    def verified_delivery(self) -> bool:
+        return self.tests_passed and self.review_approved
 
     def exceeded_repair_limit(self) -> bool:
         return self.repair_attempts >= self.max_repair_attempts

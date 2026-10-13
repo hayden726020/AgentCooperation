@@ -14,6 +14,8 @@ models:
     base_url: "https://api.deepseek.com/v1"
     input_price_per_m_usd: 0.15
     output_price_per_m_usd: 0.60
+    peak_input_price_per_m_usd: 0.30
+    peak_output_price_per_m_usd: 1.20
 
 budget:
   monthly_cny: 200.0
@@ -50,3 +52,5 @@ repair:
 execution:
   timeout_seconds: 600
   git_worktree_base: ".worktrees"
+  max_output_tokens: 8192
+  max_context_tokens: 200000

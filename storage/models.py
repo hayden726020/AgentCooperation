@@ -89,3 +89,28 @@ class MonthlySpending(SQLModel, table=True):
     total_completion_tokens: int = 0
     total_cost_cny: float = 0.0
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class BudgetReservation(SQLModel, table=True):
+    """New table so existing task/month schemas require no ALTER migration."""
+    __tablename__ = "budget_reservations"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reservation_id: str = Field(index=True, unique=True)
+    task_id: str = Field(index=True)
+    year_month: str = Field(index=True)
+    estimated_cost_cny: float
+    simulated: bool = False
+    status: str = "RESERVED"
+    actual_cost_cny: Optional[float] = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class PendingAuditContext(SQLModel, table=True):
+    """Full evidence and processing lease, compatible with existing audit rows."""
+    __tablename__ = "pending_audit_contexts"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    audit_id: str = Field(index=True, unique=True)
+    worktree_path: str = ""
+    issue_context: str = ""
+    test_summary: str = ""
+    claimed_at: Optional[datetime] = None

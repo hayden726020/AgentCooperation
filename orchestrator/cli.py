@@ -1,185 +1,194 @@
+"""CLI for single-Flash tasks, isolated simulations and deferred audit supervision."""
+
 import argparse
 import asyncio
 import sys
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 from sqlmodel import select
 
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
-from storage.db import get_session, init_db, get_or_create_monthly_spending, get_or_create_codex_quota
-from storage.models import Task, PendingCodexAudit
-from orchestrator.core import OrchestratorCore
 from agents.codex_expert import CodexExpert
+from config.settings import settings
+from orchestrator.core import OrchestratorCore
+from storage.db import get_engine, get_or_create_codex_quota, get_or_create_monthly_spending, get_session
+from storage.models import PendingCodexAudit, Task
+
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
 
 console = Console(highlight=False)
 
 
-def show_status():
-    """打印系统当前状态：月度预算、Codex 周额度状态、待补审队列"""
-    init_db()
-    with get_session() as s:
-        spending = get_or_create_monthly_spending(s)
-        codex_quota = get_or_create_codex_quota(s)
-        pending_audits = s.exec(select(PendingCodexAudit).where(PendingCodexAudit.status == "QUEUED")).all()
-
-    # 1. 预算面板
-    budget_panel = Panel(
-        f"[bold cyan]当前月份:[/bold cyan] {spending.year_month}\n"
-        f"[bold green]累计消耗 Prompt Tokens:[/bold green] {spending.total_prompt_tokens:,}\n"
-        f"[bold green]累计消耗 Completion Tokens:[/bold green] {spending.total_completion_tokens:,}\n"
-        f"[bold yellow]总支出 (API):[/bold yellow] ¥{spending.total_cost_cny:.4f} / ¥200.00\n"
-        f"[bold blue]安全预算余量:[/bold blue] ¥{max(0.0, 200.0 - spending.total_cost_cny):.4f}",
-        title="[Budget Guard] API 预算状态 (GLM-5.3-Flash / DeepSeek-Flash)",
-        border_style="yellow"
-    )
-    console.print(budget_panel)
-
-    # 2. Codex 状态
-    quota_color = "green" if codex_quota.state == "READY" else ("red" if codex_quota.state == "EXHAUSTED" else "yellow")
-    codex_panel = Panel(
-        f"[bold]状态机状态:[/bold] [{quota_color}]{codex_quota.state}[/{quota_color}]\n"
-        f"[bold]待补审队列数:[/bold] {len(pending_audits)} 个重大问题待恢复补审\n"
-        f"[bold]上次检测时间:[/bold] {codex_quota.last_checked_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"[bold]耗尽原因/说明:[/bold] {codex_quota.exhausted_reason or '无'}",
-        title="[Codex Guard] 周额度守护与待补审状态",
-        border_style=quota_color
-    )
-    console.print(codex_panel)
-
-
-
-def list_tasks():
-    init_db()
-    with get_session() as s:
-        tasks = s.exec(select(Task).order_by(Task.id.desc()).limit(15)).all()
-
-    table = Table(title="[Tasks] 任务执行历史")
-    table.add_column("Task ID", style="cyan")
-    table.add_column("标题", style="white")
-    table.add_column("主力引擎", style="magenta")
-    table.add_column("状态", style="bold")
-    table.add_column("自修次数", style="yellow")
-    table.add_column("Token 总数", style="green")
-    table.add_column("费用 (¥)", style="yellow")
-    table.add_column("待补审", style="red")
-
-    for t in tasks:
-        state_style = "green" if t.state == "SUCCESS" else ("red" if t.state == "FAILED" else "yellow")
-        table.add_row(
-            t.task_id[:16],
-            t.title[:25],
-            t.primary_model,
-            f"[{state_style}]{t.state}[/{state_style}]",
-            str(t.repair_attempts),
-            f"{(t.total_prompt_tokens + t.total_completion_tokens):,}",
-            f"¥{t.total_cost_cny:.4f}",
-            "[!] 需补审" if t.has_pending_codex_audit else "正常"
-        )
-
-    console.print(table)
-
-
-async def run_codex_backlog(mock_mode: bool = False):
-    """处理待补审队列"""
-    core = OrchestratorCore()
-    console.print("[bold cyan][*] 正在触发 Codex 待补审队列处理...[/bold cyan]")
-    expert = CodexExpert(mock_mode=mock_mode)
-    results = await core.codex_guard.process_backlog(expert)
-
-    if not results:
-        console.print("[green][OK] 暂无待补审任务，队列为空。[/green]")
+@contextmanager
+def _core_scope(mock=False, repo_root=None):
+    if not mock:
+        yield OrchestratorCore(repo_root=repo_root)
         return
+    path = Path(settings.sqlite_db_path)
+    mock_path = path.with_name(f"{path.stem}.mock{path.suffix or '.db'}")
+    engine = get_engine(str(mock_path))
+    try:
+        with get_session(engine) as session:
+            yield OrchestratorCore(repo_root=repo_root, session=session)
+    finally:
+        engine.dispose()
 
-    table = Table(title="Codex 补审处理结果")
-    table.add_column("Audit ID", style="cyan")
-    table.add_column("关联任务", style="magenta")
-    table.add_column("处理状态", style="bold")
-    table.add_column("专家反馈摘要", style="white")
 
-    for r in results:
-        table.add_row(
-            r["audit_id"],
-            r["task_id"][:16],
-            r["status"],
-            r["feedback"]
-        )
+def show_status(mock=False):
+    with _core_scope(mock=mock) as core:
+        with core._session() as session:
+            spending = get_or_create_monthly_spending(session)
+            quota = get_or_create_codex_quota(session)
+            audits = session.exec(select(PendingCodexAudit).where(
+                PendingCodexAudit.status.in_(["QUEUED", "AUDITING", "NEEDS_REPAIR"]))).all()
+            budget = core.policy.budget
+            console.print(Panel(
+                f"账库: {'独立模拟账库（模拟成本见任务历史）' if mock else '真实调用估算账库'}\n"
+                f"月份: {spending.year_month}\n"
+                f"输入/输出 Token: {spending.total_prompt_tokens:,} / {spending.total_completion_tokens:,}\n"
+                f"API 保守估算支出: ¥{spending.total_cost_cny:.5f} / ¥{budget.monthly_cny:.2f}\n"
+                f"本地 Codex 状态: {quota.state}（不是账户实时额度查询）\n"
+                f"待补审/待修复: {len(audits)}\n"
+                f"预计恢复时间: {quota.estimated_recovery_at or '未设置'}",
+                title="运行状态", border_style="cyan"))
 
+
+def list_tasks(mock=False):
+    table = Table(title="模拟任务历史" if mock else "任务历史")
+    for label in ("Task ID", "标题", "引擎", "状态", "修复次数", "费用估算(¥)", "待补审"):
+        table.add_column(label)
+    with _core_scope(mock=mock) as core:
+        with core._session() as session:
+            tasks = session.exec(select(Task).order_by(Task.id.desc()).limit(15)).all()
+            for task in tasks:
+                table.add_row(task.task_id, task.title[:25], task.primary_model, task.state,
+                              str(task.repair_attempts), f"{task.total_cost_cny:.5f}",
+                              "是" if task.has_pending_codex_audit else "否")
     console.print(table)
 
 
-async def execute_task(req: str, model: str, mock: bool, title: str):
-    core = OrchestratorCore()
+def _print_backlog(results):
+    if not results:
+        console.print("没有可领取的待补审记录；任务运行中或待人工修复的记录会保留。")
+        return
+    table = Table(title="补审结果")
+    for name in ("Audit ID", "任务", "状态", "反馈"):
+        table.add_column(name)
+    for result in results:
+        table.add_row(result["audit_id"], result["task_id"], result["status"], result["feedback"])
+    console.print(table)
+
+
+async def run_codex_backlog(mock_mode=False):
+    with _core_scope(mock=mock_mode) as core:
+        results = await core.codex_guard.process_backlog(CodexExpert(mock_mode=mock_mode),
+                                                        allow_simulated=mock_mode)
+        _print_backlog(results)
+        return results
+
+
+async def watch_codex_backlog(mock_mode=False, interval=300, cycles=None):
+    if interval < 30:
+        raise ValueError("Recovery checks must be at least 30 seconds apart")
+    count = 0
+    with _core_scope(mock=mock_mode) as core:
+        expert = CodexExpert(mock_mode=mock_mode)
+        while True:
+            try:
+                if core.codex_guard.get_pending_audits() and await core.codex_guard.probe_recovery(
+                        expert, worktree_path=Path.cwd(), allow_simulated=mock_mode):
+                    results = await core.codex_guard.process_backlog(expert, allow_simulated=mock_mode)
+                    if results:
+                        _print_backlog(results)
+            except Exception as error:
+                console.print(f"补审检查失败，记录保留：{type(error).__name__}")
+            count += 1
+            if cycles is not None and count >= cycles:
+                return
+            await asyncio.sleep(interval)
+
+
+async def execute_task(req, model, mock, title, *, repo_root=None, test_command=None):
+    model = model or settings.load_policy().primary_agent
     console.print(Panel(
-        f"[bold]任务需求:[/bold] {req}\n"
-        f"[bold]主力模型:[/bold] {model} (互斥独占单引擎模式)\n"
-        f"[bold]执行模式:[/bold] {'Mock 模拟演练' if mock else '真实线上调用'}",
-        title="[Start] 正在启动全自动多 Agent 任务编排",
-        border_style="cyan"
-    ))
-
-    task = await core.run_task(
-        requirement=req,
-        title=title,
-        chosen_model=model,
-        mock_mode=mock
-    )
-
-    color = "green" if task.state == "SUCCESS" else "red"
+        f"需求: {req}\n引擎: {model}（单任务二选一）\n"
+        f"模式: {'显式模拟，使用独立账库' if mock else '真实调用'}",
+        title="启动任务", border_style="cyan"))
+    with _core_scope(mock=mock, repo_root=repo_root) as core:
+        task = await core.run_task(req, title=title, chosen_model=model, mock_mode=mock,
+                                   custom_test_cmd=test_command)
     console.print(Panel(
-        f"[bold]任务 ID:[/bold] {task.task_id}\n"
-        f"[bold]最终状态:[/bold] [{color}]{task.state}[/{color}]\n"
-        f"[bold]自修尝试:[/bold] {task.repair_attempts} 次\n"
-        f"[bold]消耗 Token:[/bold] {task.total_prompt_tokens + task.total_completion_tokens:,}\n"
-        f"[bold]任务总支出:[/bold] ¥{task.total_cost_cny:.4f}\n"
-        f"[bold]Codex 待补审:[/bold] {'是 (周额度耗尽已优雅排队)' if task.has_pending_codex_audit else '否'}\n"
-        f"[bold]工作空间目录:[/bold] {task.worktree_path}",
-        title="[Complete] 任务编排结束",
-        border_style=color
-    ))
+        f"任务: {task.task_id}\n状态: {task.state}\n费用估算: ¥{task.total_cost_cny:.5f}\n"
+        f"工作目录: {task.worktree_path}\n{task.result_summary}",
+        title="模拟结果" if mock else "任务结果",
+        border_style="green" if task.state == "SUCCESS" else "yellow"))
+    return task
 
+
+def _reset_time(value):
+    try:
+        result = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Use an ISO timestamp, e.g. 2026-10-20T12:00:00+08:00") from error
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone(timedelta(hours=8)))
+    return result.astimezone(timezone.utc)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GLM & DeepSeek Flash 协同编排自动化引擎")
+    parser = argparse.ArgumentParser(description="单 Flash API + Gemini/Codex CLI 调度器")
     subparsers = parser.add_subparsers(dest="command")
-
-    # run command
-    run_parser = subparsers.add_parser("run", help="启动执行自动化编程任务")
-    run_parser.add_argument("--task", "-t", required=True, help="任务描述")
-    run_parser.add_argument("--title", default=None, help="任务简短标题")
-    run_parser.add_argument("--model", "-m", choices=["glm", "deepseek"], default="glm", help="主力 Flash 代码模型 (二选一)")
-    run_parser.add_argument("--mock", action="store_true", help="启用 Mock 模拟演练（不调用真实 API）")
-
-    # status command
-    subparsers.add_parser("status", help="查看月度预算与 Codex 额度状态")
-
-    # tasks command
-    subparsers.add_parser("tasks", help="查看任务执行历史")
-
-    # codex-backlog command
-    backlog_parser = subparsers.add_parser("codex-backlog", help="重试处理 Codex 待补审队列")
-    backlog_parser.add_argument("--mock", action="store_true", help="使用模拟 Codex 专家")
-
+    run_parser = subparsers.add_parser("run", help="执行任务")
+    run_parser.add_argument("--task", "-t", required=True)
+    run_parser.add_argument("--title", default=None)
+    run_parser.add_argument("--model", "-m", choices=["glm", "deepseek"], default=None)
+    run_parser.add_argument("--mock", action="store_true")
+    run_parser.add_argument("--repo-root", type=Path, default=None, help="已有初始提交的目标 Git 项目")
+    run_parser.add_argument("--test-command", default=None, help="明确指定目标验收命令")
+    for command in ("status", "tasks", "codex-backlog"):
+        command_parser = subparsers.add_parser(command)
+        command_parser.add_argument("--mock", action="store_true")
+    watcher = subparsers.add_parser("codex-watch", help="按恢复时间自动探测并补审")
+    watcher.add_argument("--mock", action="store_true")
+    watcher.add_argument("--interval", type=int, default=300)
+    quota = subparsers.add_parser("codex-quota", help="设置本地额度状态与官方恢复时间")
+    quota.add_argument("--state", required=True, choices=["READY", "RESERVED", "EXHAUSTED", "RECOVERING"])
+    quota.add_argument("--reset-at", type=_reset_time, default=None, help="无时区时按北京时间处理")
+    quota.add_argument("--mock", action="store_true")
     args = parser.parse_args()
-
-    if args.command == "run":
-        asyncio.run(execute_task(args.task, args.model, args.mock, args.title))
-    elif args.command == "status":
-        show_status()
-    elif args.command == "tasks":
-        list_tasks()
-    elif args.command == "codex-backlog":
-        asyncio.run(run_codex_backlog(args.mock))
-    else:
-        parser.print_help()
+    try:
+        if args.command == "run":
+            task = asyncio.run(execute_task(args.task, args.model, args.mock, args.title,
+                                           repo_root=args.repo_root, test_command=args.test_command))
+            return 0 if task.state == "SUCCESS" else 2
+        if args.command == "status":
+            show_status(args.mock)
+        elif args.command == "tasks":
+            list_tasks(args.mock)
+        elif args.command == "codex-backlog":
+            results = asyncio.run(run_codex_backlog(args.mock))
+            return 2 if any(r["status"] not in {"RESOLVED", "SIMULATED"} for r in results) else 0
+        elif args.command == "codex-watch":
+            asyncio.run(watch_codex_backlog(args.mock, args.interval))
+        elif args.command == "codex-quota":
+            with _core_scope(mock=args.mock) as core:
+                core.codex_guard.set_quota_state(args.state, reason="Operator override", recovery_at=args.reset_at)
+        else:
+            parser.print_help()
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        console.print(f"执行失败：{error}", style="red", markup=False)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

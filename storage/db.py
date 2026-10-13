@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 from sqlmodel import SQLModel, create_engine, Session, select
 from datetime import datetime, timezone
 from storage.models import (
@@ -42,6 +43,25 @@ def provide_session(session: Optional[Session] = None):
     else:
         with get_session() as s:
             yield s
+
+
+@contextmanager
+def locked_session(session: Optional[Session] = None):
+    """Serialize SQLite read/check/write transactions across worker processes.
+
+    Guard methods own their transaction boundary; callers must commit their
+    pending changes before invoking them. No network call runs under this lock.
+    """
+    with provide_session(session) as s:
+        s.commit()
+        s.expire_all()
+        s.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            yield s
+            s.commit()
+        except BaseException:
+            s.rollback()
+            raise
 
 
 def get_or_create_monthly_spending(session: Session, year_month: str = None) -> MonthlySpending:

@@ -20,6 +20,8 @@ def test_fsm_normal_lifecycle():
     assert fsm.state == "REVIEWING"
 
     # 复核通过 -> 成功
+    fsm.tests_passed = True
+    fsm.review_approved = True
     fsm.to_success()
     assert fsm.state == "SUCCESS"
 
@@ -58,6 +60,11 @@ def test_fsm_repair_loop_and_escalate():
     fsm.to_codex_backlogged()
     assert fsm.state == "CODEX_BACKLOGGED"
 
-    # 优雅收敛至成功（打待补审标记）
-    fsm.to_success()
-    assert fsm.state == "SUCCESS"
+    # 排队本身不是成功，仍需经过测试和复核。
+    fsm.to_repairing_from_backlog()
+    fsm.to_testing()
+    fsm.to_reviewing()
+    assert not fsm.to_success()
+    fsm.tests_passed = True
+    fsm.review_approved = True
+    assert fsm.to_success()

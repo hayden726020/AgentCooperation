@@ -4,6 +4,7 @@ from orchestrator.codex_guard import CodexQuotaGuard
 from config.settings import CodexConfig
 from storage.models import Task, PendingCodexAudit
 from agents.codex_expert import CodexExpert
+from agents.base import AgentResult
 
 
 @pytest.fixture
@@ -57,7 +58,7 @@ async def test_codex_backlog_recovery(in_memory_session):
     cfg = CodexConfig()
     guard = CodexQuotaGuard(cfg, in_memory_session)
 
-    task = Task(task_id="t_002", title="Task 2", requirement="Req")
+    task = Task(task_id="t_002", title="Task 2", requirement="Req", state="SUCCESS")
     in_memory_session.add(task)
     in_memory_session.commit()
 
@@ -72,7 +73,11 @@ async def test_codex_backlog_recovery(in_memory_session):
     assert guard.state == "EXHAUSTED"
 
     # 模拟额度恢复后运行补审
-    mock_expert = CodexExpert(mock_mode=True)
+    class ApprovedExpert:
+        async def execute(self, prompt, context=None):
+            return AgentResult(success=True, content='Approved', metadata={
+                'review': {'approved': True, 'severity': 'P3'}})
+    mock_expert = ApprovedExpert()
     results = await guard.process_backlog(mock_expert)
 
     assert len(results) == 1

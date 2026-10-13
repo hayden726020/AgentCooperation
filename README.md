@@ -1,177 +1,115 @@
-# AgentCooperation: 全自动多 Agent 协同编排引擎
+# AgentCooperation
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Architecture](https://img.shields.io/badge/Architecture-API%20%2B%20CLI%20Hybrid-orange.svg)]()
-[![License](https://img.shields.io/badge/License-MIT-green.svg)]()
+Python + SQLite 编排器：每个任务选择 **GLM Flash 或 DeepSeek Flash 其中一个**，由同一引擎负责规划、开发和修复；Gemini CLI 独立验收，Codex CLI 处理重要问题及延期补审。
 
-基于 **GLM-5.3-Flash / DeepSeek-Flash 原生 API** + **Gemini CLI 独立审查** + **Codex CLI 专家兜底** 的全自动端到端软件开发调度系统。
+单任务 Flash 二选一是用户指定的架构。所有阶段复用该实例，禁止中途串联另一 Flash 引擎。
 
----
+## 当前交付规则
 
-## 一、核心架构原则与设计哲学
+- 每次模型调用检查成功状态、实际文件输出与预算；缺密钥立即报错，模拟必须显式开启。
+- 测试失败最多进行三轮常规修复。审查拒绝同样需要修复和重新测试。
+- 专家补丁和额度耗尽后的替代修复都返回测试、独立复核；测试及审查通过才能进入 `SUCCESS`。
+- P0 进入 `WAITING_APPROVAL`，保留严重级别和专家意见，停止自动应用专家补丁。
+- Codex 禁用、保留状态、恢复中、调用次数耗尽与确认用量耗尽分别处理。一般 429/网络故障不标为周额度耗尽。
+- Codex 耗尽时保存完整问题、最终提交、diff、测试和 Gemini 结果；通过验证的 P1 成果可带补审标记完成。
+- 补审仅领取已完成或暂停任务。真实审查在调用前后验证完整提交 SHA 及干净工作区；失败保留记录，发现问题标为 `NEEDS_REPAIR`，明确批准后才关闭。
 
-1. **主力 Flash 引擎同位互斥（二选一贯穿闭环）**
-   - **`GLM-5.3-Flash`** 与 **`DeepSeek-Flash`** 在系统中**承担完全相同的角色**（主力开发、测试自修）。
-   - **架构铁律**：在任何单个任务的生命周期中，**只激活其中一个引擎贯穿始终**，绝不在同一进程或上下文中串联/级联两个 Flash 模型，杜绝幻觉传递与重复 Token 损耗。
+## 安装与配置
 
-2. **API 与本地 CLI 混合双轨调度**
-   - **主力研发模型**：走原生 **OpenAI-Compatible 异步 API** 调用，精准捕获 `usage.prompt_tokens` 与 `completion_tokens`，实现 100% 准确的阶梯预算控制（¥200/月）。
-   - **独立审查与专家顾问**：调用本地已登录订阅的 **Gemini CLI** 与 **Codex CLI**，不消耗 API 费用。
+需要 Python 3.11+、Git；真实审查需要已安装并登录的 Gemini CLI 和 Codex CLI。
 
-3. **零 Token 开销的确定性有限状态机（FSM）**
-   - 基于成熟轻量级 `pytransitions` 引擎，由纯 Python 控制任务流转（`PLANNING -> DEVELOPING -> TESTING -> REPAIRING -> REVIEWING -> ESCALATING -> SUCCESS`），核心编排不耗费任何模型 Token。
-
-4. **Codex 周额度优雅降级与延期补审机制**
-   - **拒绝盲目中断**：当 Codex 本地 CLI 遇到周额度耗尽（`EXHAUSTED`）时，系统自动将重大架构争议持久化至 SQLite `PendingCodexAudit` 待补审单中。
-   - **保障主线收敛**：让 Gemini CLI 与主力 Flash 先行完成安全可控的工作，任务正常收尾并打上待补审标记。
-   - **恢复后闭环**：周额度重置后，通过后台看门狗自动重试处理历史补审单。
-
-5. **物理隔离与 Git Worktree 检查点**
-   - 各任务拥有独立 Git Worktree 工作空间与专属分支，修改与破坏性实验互不干扰。
-   - 每次代码生成与自修自动创建 Git Commit 检查点，支持测试失败后的硬回滚。
-
----
-
-## 二、架构流程时序图
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant User as 用户 / CLI 入口
-    participant Guard as 预算守护器 (BudgetGuard)
-    participant FSM as 状态机调度器 (TaskFSM)
-    participant Flash as 主力 Flash (GLM 或 DeepSeek 独占)
-    participant Test as 本地测试套件 (TestRunner)
-    participant Gemini as 独立审查 (Gemini CLI)
-    participant Codex as 高级顾问 (Codex CLI)
-    participant DB as SQLite 数据库持久化
-
-    User->>Guard: 提交开发任务
-    Guard->>Guard: 检查月度预算 (< ¥190)
-    Guard->>FSM: 准入通过，启动任务 FSM
-    FSM->>Flash: 阶段 1: 架构与任务规划 (TASK.md + SPEC.json)
-    Flash->>DB: 记录消耗 Token 与 ¥ 费用
-    FSM->>Flash: 阶段 2: 代码实现与单元测试生成
-    Flash->>DB: 创建 Git Checkpoint
-    loop 最多 3 次自修
-        FSM->>Test: 阶段 3: 执行自动化测试
-        alt 测试通过
-            Test-->>FSM: 测试全绿
-        else 测试失败 (< 3次)
-            FSM->>Flash: 传递失败堆栈，自修代码
-        end
-    end
-    alt 自修超过3次 / 发现 P1 架构冲突
-        FSM->>Codex: 阶段 4: 升级至 Codex 专家
-        alt Codex 周额度耗尽 (EXHAUSTED)
-            Codex-->>DB: 生成 PendingCodexAudit 待补审单
-            FSM->>FSM: 切入 CODEX_BACKLOGGED 状态，允许安全收工
-        else Codex 可调用
-            Codex-->>Flash: 给出权威补丁决策并修复
-        end
-    else 正常通过
-        FSM->>Gemini: 阶段 5: Gemini CLI 审查 Git Diff
-        Gemini-->>FSM: 审查通过 (P3/P2)
-    end
-    FSM->>DB: 任务归档完成 (SUCCESS)
-    FSM-->>User: 交付产物与分支
-```
-
----
-
-## 三、目录结构
-
-```
-e:\AgentCooperation\
-├── config/                  # 系统策略与环境配置
-│   ├── policy.yaml          # 定价、额度阈值、超时与模型规则
-│   └── settings.py          # Pydantic 校验与环境加载
-├── agents/                  # 统一 Agent 适配层 (API + CLI 混合)
-│   ├── base.py              # 抽象基类与 AgentResult
-│   ├── flash_api.py         # GLM-5.3-Flash & DeepSeek-Flash 异步 API
-│   ├── gemini_reviewer.py   # Gemini CLI 子进程审查器
-│   ├── codex_expert.py      # Codex CLI 专家与周额度检测
-│   └── opencode_runner.py   # OpenCode CLI 可选终端沙箱运行器
-├── orchestrator/            # 调度编排核心中枢
-│   ├── engine_selector.py   # 单引擎槽位互斥守卫
-│   ├── fsm.py               # pytransitions 状态机
-│   ├── budget_guard.py      # ¥200/月 阶梯预算守护器
-│   ├── codex_guard.py       # Codex Quota 状态机与待补审队列
-│   ├── core.py              # 全流程自动化驱动核心
-│   └── cli.py               # Rich 交互式终端入口
-├── execution/               # 进程与沙箱环境控制
-│   ├── subproc.py           # 非交互防卡死、ANSI 清洗与看门狗
-│   ├── worktree.py          # Git Worktree 隔离与检查点回退
-│   └── test_runner.py       # 自动化测试探查与执行 (pytest/npm)
-├── storage/                 # 持久化存储 (SQLite + SQLModel)
-│   ├── models.py            # Task, ExecutionLog, PendingCodexAudit
-│   └── db.py                # 数据库 Session 与初始化
-├── references/              # 精选开源参考代码仓库
-│   ├── transitions/         # 有限状态机底层参考
-│   ├── cli-agent-orchestrator/ # CLI 子进程调度模式参考
-│   └── multi-agent-code-review/ # 代码审查契约参考
-└── tests/                   # 100% 覆盖的核心自动化测试套件
-```
-
----
-
-## 四、快速安装与配置
-
-### 1. 安装依赖
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量（可选）
-在工程根目录创建 `.env` 文件：
-```ini
-# 主力 API 密钥（二选一或全部配置）
-GLM_API_KEY="your-zhipu-api-key"
-DEEPSEEK_API_KEY="your-deepseek-api-key"
+在项目根目录的 `.env` 中配置选定引擎的密钥：
 
-# 本地 CLI 命令别名（若已加入系统 PATH 则无需修改）
+```ini
+GLM_API_KEY="your-key"
+DEEPSEEK_API_KEY="your-key"
 GEMINI_CLI_CMD="gemini"
 CODEX_CLI_CMD="codex"
 ```
 
----
+也支持 `FLASH_API_KEY` / `FLASH_BASE_URL` 通用覆盖。密钥文件不会由模型生成流程修改。
 
-## 五、CLI 命令行工具使用指南
+模型 ID、端点、费率、输出上限和预算位于 `config/policy.yaml`。发布环境必须验证账号可用模型与实际费率。当前价格是可配置的估算参数；DeepSeek 按高峰上界保守记账，缓存折扣没有抵扣预留。
 
-### 1. 查看系统运行状态与预算
+目标 Git 项目必须已经有初始提交，并已配置本地提交身份。程序不会自动暂存并初始化用户主仓库。
+
+## 使用
+
+在编排器目录运行，指定要开发的目标项目：
+
 ```bash
+python -m orchestrator.cli run --repo-root /path/to/target-repo --task "实现缓存模块并编写行为测试" --model glm
+python -m orchestrator.cli run --repo-root /path/to/target-repo --task "实现二叉搜索树并测试" --model deepseek
+```
+
+不指定 `--model` 时使用策略中的 `agents.primary`。
+
+```bash
+python -m orchestrator.cli run --repo-root /path/to/target-repo --task "演练调度流程" --mock
 python -m orchestrator.cli status
-```
-* 输出月度累计 Token 消耗、¥ 支出（对比 ¥200 上限）以及 Codex 当前额度状态。
-
-### 2. 启动自动化开发任务
-```bash
-# 使用默认 GLM 引擎进行真实开发
-python -m orchestrator.cli run --task "开发一个高并发安全的线程安全LRU缓存模块，包含单元测试" --model glm
-
-# 切换为 DeepSeek 引擎进行开发
-python -m orchestrator.cli run --task "实现二叉搜索树并编写测试" --model deepseek
-
-# 离线演练 / Mock 模式（不消耗 API 费用）
-python -m orchestrator.cli run --task "模拟全生命周期测试" --mock
-```
-
-### 3. 查看任务执行历史
-```bash
 python -m orchestrator.cli tasks
+python -m orchestrator.cli status --mock
+python -m orchestrator.cli tasks --mock
 ```
 
-### 4. 触发 Codex 周额度恢复后的补审处理
+模拟运行生成固定演练代码，只验证调度链路。模拟账库为原数据库名加 `.mock`，例如 `data/agent_orchestrator.mock.db`；模拟不能恢复真实额度或关闭真实审单。历史旧版本账本可能含有模拟费用，升级不会删除历史记录。
+
+任务失败、预算停止、等待批准或等待审查时，命令返回非零退出码。
+
+默认测试纳入目标已有 `tests/`、根目录 `test_*.py` / `*_test.py` 及新生成的测试。支持 pytest、unittest、Jest/Vitest、Mocha、Node TAP 统计。零测试、全跳过、全预期失败、无法确认测试执行的输出不会通过验收。目标有特殊测试入口时可以指定：
+
+```bash
+python -m orchestrator.cli run --repo-root /path/to/target-repo --task "修复边界错误" --test-command "npm test"
+```
+
+## 预算
+
+默认月度 ¥200、¥160 告警、¥190 暂停新任务、单任务 ¥10。
+
+每次 API 调用根据输入字节上界、输出 Token 限制和保守费率，先在 SQLite 事务中预留；任务与月预算均计入并发预留。调用后幂等结算，专家补丁也记账。未知用量或中断按预留额保守处理。模拟费用只记模拟任务，不进入真实月支出。
+
+本地估算无法替代服务商账单和账户消费上限。¥160 当前提供告警；输出上限可通过策略调整。
+
+## Codex 补审恢复
+
 ```bash
 python -m orchestrator.cli codex-backlog
+python -m orchestrator.cli codex-backlog --mock
 ```
 
----
+人工根据官方用量信息设置本地状态和恢复时间：
 
-## 六、自动化测试验证
-
-运行完整的单元测试与端到端测试套件：
 ```bash
-pytest tests/ -v
+python -m orchestrator.cli codex-quota --state EXHAUSTED --reset-at "2026-10-20T12:00:00+08:00"
+python -m orchestrator.cli codex-watch --interval 300
 ```
-所有测试均包含内存数据库隔离与独立状态机断言，开箱即用。
+
+没有时区的时间按北京时间解释。监控进程保持运行时，在记录的恢复时间后轻量探测，成功才处理队列；未设置恢复时间时等待人工设置或手动补审。CLI 监控不是已安装的 systemd 服务。
+
+`NEEDS_REPAIR` 保留人工可见反馈和任务标记。后续修复提交重新更新证据后可以再次排队；当前不自动新建另一编程任务。
+
+## 执行边界
+
+各任务使用验证过的 Git worktree、`codex/task_<任务ID>` 分支和固定基础提交；创建或检查点失败立即停止。生成文件及上下文读取拒绝越界、链接及敏感目录。
+
+子进程过滤继承环境中的 API 凭据，超时及取消会回收进程。Git worktree 隔离的是文件版本，目标测试仍在本机执行。无人值守处理不受信任项目前，需要部署操作系统或容器权限、网络和凭据隔离；仓库尚未提供 Docker/systemd 部署。
+
+当前入口为 CLI，OpenCode 为独立适配器，Web/Telegram 控制台和任意任务中断后的自动续跑尚未提供。
+
+## 验证
+
+```bash
+python -m pytest tests/ -q -p no:cacheprovider
+```
+
+测试包含故障回归、内存/独立数据库、真实临时 Git 仓库和真实进程清理；模型 API 和模型 CLI 用模拟返回验证，测试不产生模型费用。实际符号链接测试在 Windows 缺少权限时跳过，目录联接保护仍有真实 Windows 回归。
+
+当前开发环境为 Windows / Python 3.14。Python 3.11 语法已检查；较旧版本实际运行和真实服务联调仍待验证。
+
+## 开源参考
+
+`references/` 记录 transitions、awslabs/cli-agent-orchestrator 和 multi-agent-code-review。运行时实际使用 `transitions` 依赖；另两个项目是代码参考。需要拉取参考代码时使用 Git 子模块初始化。

@@ -32,18 +32,32 @@ class SubprocResult:
         return self.exit_code == 0 and not self.timed_out
 
 
+SAFE_ENV_KEYS = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+    "PROGRAMFILES(X86)", "SYSTEMDRIVE", "HOMEDRIVE", "HOMEPATH", "USER", "USERNAME",
+    "LANG", "LC_ALL", "LC_CTYPE", "VIRTUAL_ENV", "CONDA_PREFIX", "NUMBER_OF_PROCESSORS",
+}
+
+
 def kill_process_tree(pid: int):
-    """安全终止进程及其所有子进程树"""
+    """Kill and reap a process tree; report denied access or surviving processes."""
     try:
         parent = psutil.Process(pid)
-        for child in parent.children(recursive=True):
-            try:
-                child.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        parent.kill()
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
+        processes = parent.children(recursive=True) + [parent]
+    except psutil.NoSuchProcess:
+        return
+    errors = []
+    for process in processes:
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied as exc:
+            errors.append(str(exc))
+    _, alive = psutil.wait_procs(processes, timeout=2)
+    if errors or alive:
+        raise RuntimeError(f"Process cleanup failed: {errors}; surviving PIDs: {[p.pid for p in alive]}")
 
 
 async def run_async_command(
@@ -62,7 +76,7 @@ async def run_async_command(
     start_time = time.time()
     
     # 构造非交互式环境变量
-    merged_env = os.environ.copy()
+    merged_env = {key: value for key, value in os.environ.items() if key.upper() in SAFE_ENV_KEYS}
     merged_env.update({
         "CI": "1",
         "NONINTERACTIVE": "1",
@@ -84,21 +98,42 @@ async def run_async_command(
         stderr=asyncio.subprocess.PIPE
     )
 
-    input_bytes = input_text.encode("utf-8") if input_text else None
+    input_bytes = input_text.encode("utf-8") if input_text is not None else None
     timed_out = False
+
+    communication = asyncio.create_task(proc.communicate(input=input_bytes))
+
+    async def cleanup():
+        try:
+            await asyncio.wait_for(asyncio.to_thread(kill_process_tree, proc.pid), timeout=4)
+        except Exception as cleanup_error:
+            # Close the direct child and its pipes even when process-tree cleanup failed.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(communication), timeout=3)
+            except Exception as drain_error:
+                raise RuntimeError(f"Process cleanup and pipe drain failed: {drain_error}") from cleanup_error
+            raise
+        return await asyncio.wait_for(asyncio.shield(communication), timeout=3)
 
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=input_bytes),
+            asyncio.shield(communication),
             timeout=timeout
         )
     except asyncio.TimeoutError:
         timed_out = True
-        kill_process_tree(proc.pid)
+        stdout_bytes, stderr_bytes = await cleanup()
+    except asyncio.CancelledError:
+        cleanup_task = asyncio.create_task(cleanup())
         try:
-            stdout_bytes, stderr_bytes = await proc.communicate()
-        except Exception:
-            stdout_bytes, stderr_bytes = b"", b""
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+        raise
 
     duration = time.time() - start_time
     raw_stdout = stdout_bytes.decode("utf-8", errors="replace")

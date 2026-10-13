@@ -168,10 +168,12 @@ async def test_cleanup_failure_is_reported(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_windows_custom_command_quotes_execute(tmp_path):
-    command = subprocess.list2cmdline([sys.executable, "-c", "print('quoted command succeeded')"])
+    test_file = tmp_path / "test target with spaces.py"
+    test_file.write_text("def test_example():\n    assert 2 + 2 == 4\n", encoding="utf-8")
+    command = subprocess.list2cmdline([sys.executable, "-m", "pytest", "-q", str(test_file)])
     outcome = await Runner(tmp_path, custom_test_cmd=command).run()
     assert outcome.passed
-    assert "quoted command succeeded" in outcome.raw_output
+    assert outcome.total_tests == 1
 
 
 @pytest.mark.asyncio
@@ -223,3 +225,37 @@ def test_default_target_includes_existing_tests_directory(tmp_path):
     (tmp_path / "test_new.py").write_text("# target\n")
     (tmp_path / "tests").mkdir()
     assert "tests" in TestRunner(tmp_path).detect_command()
+
+
+@pytest.mark.asyncio
+async def test_custom_successful_command_without_test_evidence_is_rejected(tmp_path):
+    outcome = await Runner(tmp_path, custom_test_argv=[sys.executable, "-c", "print('ok')"]).run()
+    assert not outcome.passed
+    assert outcome.total_tests == 0
+    assert "Unsupported" in outcome.summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output, total, failed, passed", [
+    ("echo complete", 0, 0, False),
+    ("Tests: 2 passed, 2 total", 2, 0, True),
+    ("Tests 1 failed | 3 passed (4)", 4, 1, False),
+    ("  3 passing (10ms)\n  1 pending", 4, 0, True),
+    ("  2 passing (10ms)\n  1 failing", 3, 1, False),
+    ("# tests 3\n# pass 2\n# fail 0\n# skipped 1\n# todo 0", 3, 0, True),
+    ("#tests 3\n#pass 2\n#fail 1", 3, 1, False),
+    ("# tests 2\n# pass 0\n# fail 0\n# skipped 2", 2, 0, False),
+])
+async def test_custom_runner_requires_successful_test_counts(tmp_path, monkeypatch, output, total, failed, passed):
+    monkeypatch.setattr("execution.test_runner.run_async_command", AsyncMock(return_value=result(stdout=output)))
+    outcome = await Runner(tmp_path, custom_test_argv=["npm", "test"]).run()
+    assert outcome.passed is passed
+    assert outcome.total_tests == total
+    assert outcome.failed_tests == failed
+
+
+@pytest.mark.asyncio
+async def test_unittest_expected_failures_are_not_successful_tests(tmp_path, monkeypatch):
+    monkeypatch.setattr("execution.test_runner.run_async_command", AsyncMock(return_value=result(stdout="Ran 1 test in 0.001s\nOK (expected failures=1)")))
+    outcome = await Runner(tmp_path, custom_test_argv=[sys.executable, "-m", "unittest"]).run()
+    assert not outcome.passed

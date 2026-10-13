@@ -1,6 +1,7 @@
+import os
 import time
 from typing import Dict, Any, Optional
-from agents.base import BaseAgent, AgentResult
+from agents.base import BaseAgent, AgentResult, redact_credentials, task_directory
 from execution.subproc import run_async_command, SubprocResult
 from config.settings import settings
 
@@ -21,10 +22,21 @@ class OpenCodeRunner(BaseAgent):
         self.agent_type = agent_type
         self.cli_cmd = cli_cmd or settings.opencode_cli_cmd
 
+    def _provider_credentials(self) -> dict[str, str]:
+        """Pass only the explicitly selected provider's API credential."""
+        provider = self.model_name.partition("/")[0].casefold()
+        if provider in {"zai", "zhipuai", "glm"}:
+            key = settings.glm_api_key or os.getenv("GLM_API_KEY")
+            return {"GLM_API_KEY": key} if key else {}
+        if provider == "deepseek":
+            key = settings.deepseek_api_key or os.getenv("DEEPSEEK_API_KEY")
+            return {"DEEPSEEK_API_KEY": key} if key else {}
+        return {}
+
     async def execute(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         start_time = time.time()
         context = context or {}
-        worktree_path = context.get("worktree_path")
+        credential_env: dict[str, str] = {}
 
         cmd = [
             self.cli_cmd,
@@ -35,9 +47,12 @@ class OpenCodeRunner(BaseAgent):
         ]
 
         try:
+            worktree_path = task_directory(context)
+            credential_env = self._provider_credentials()
             res: SubprocResult = await run_async_command(
                 cmd=cmd,
                 cwd=worktree_path,
+                env=credential_env,
                 timeout=600.0
             )
             duration = time.time() - start_time
@@ -47,7 +62,7 @@ class OpenCodeRunner(BaseAgent):
                     success=False,
                     content="",
                     duration_s=duration,
-                    error=f"OpenCode error (exit {res.exit_code}): {res.stderr[:300]}"
+                    error=redact_credentials(f"OpenCode error (exit {res.exit_code}): {res.stderr[:300]}", credential_env)
                 )
 
             return AgentResult(
@@ -62,5 +77,5 @@ class OpenCodeRunner(BaseAgent):
                 success=False,
                 content="",
                 duration_s=duration,
-                error=f"Failed to run OpenCode: {str(e)}"
+                error=redact_credentials(f"Failed to run OpenCode: {str(e)}", credential_env)
             )

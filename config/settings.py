@@ -1,24 +1,33 @@
 from pathlib import Path
 from typing import Literal, Optional, List
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class ModelPricing(BaseModel):
     model_id: str
     base_url: str = ""
-    input_price_per_m_usd: float = 0.15
-    output_price_per_m_usd: float = 0.50
+    input_price_per_m_usd: float = Field(default=0.15, ge=0, allow_inf_nan=False)
+    output_price_per_m_usd: float = Field(default=0.50, ge=0, allow_inf_nan=False)
+    peak_input_price_per_m_usd: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    peak_output_price_per_m_usd: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    cache_input_price_per_m_usd: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class BudgetConfig(BaseModel):
-    monthly_cny: float = 200.0
-    warning_cny: float = 160.0
-    pause_new_cny: float = 190.0
-    hard_stop_cny: float = 200.0
-    task_limit_cny: float = 10.0
-    usd_to_cny_rate: float = 7.25
+    monthly_cny: float = Field(default=200.0, gt=0, allow_inf_nan=False)
+    warning_cny: float = Field(default=160.0, ge=0, allow_inf_nan=False)
+    pause_new_cny: float = Field(default=190.0, ge=0, allow_inf_nan=False)
+    hard_stop_cny: float = Field(default=200.0, gt=0, allow_inf_nan=False)
+    task_limit_cny: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    usd_to_cny_rate: float = Field(default=7.25, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode='after')
+    def ordered_limits(self):
+        if not self.warning_cny <= self.pause_new_cny <= self.hard_stop_cny <= self.monthly_cny:
+            raise ValueError('Budget limits must satisfy warning <= pause <= hard stop <= monthly')
+        return self
 
 
 class CodexConfig(BaseModel):
@@ -43,6 +52,8 @@ class RepairConfig(BaseModel):
 class ExecutionConfig(BaseModel):
     timeout_seconds: int = 600
     git_worktree_base: str = ".worktrees"
+    max_output_tokens: int = Field(default=8192, gt=0)
+    max_context_tokens: int = Field(default=200000, gt=0)
 
 
 class PolicyConfig(BaseModel):

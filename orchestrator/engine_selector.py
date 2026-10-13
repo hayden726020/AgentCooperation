@@ -53,6 +53,7 @@ class SingleEngineSlotEnforcer:
                 )
 
         api_key = settings.glm_api_key if target_key == "glm" else settings.deepseek_api_key
+        api_key = api_key or settings.flash_api_key
 
         self._active_model_key = target_key
         self._active_agent = FlashApiAgent(
@@ -60,6 +61,7 @@ class SingleEngineSlotEnforcer:
             pricing=pricing,
             budget_cfg=self.policy.budget,
             api_key=api_key,
+            base_url=settings.flash_base_url or pricing.base_url,
             mock_mode=mock_mode
         )
         return self._active_agent

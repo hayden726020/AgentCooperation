@@ -1,0 +1,9 @@
+[submodule "references/transitions"]
+	path = references/transitions
+	url = https://github.com/pytransitions/transitions.git
+[submodule "references/cli-agent-orchestrator"]
+	path = references/cli-agent-orchestrator
+	url = https://github.com/awslabs/cli-agent-orchestrator.git
+[submodule "references/multi-agent-code-review"]
+	path = references/multi-agent-code-review
+	url = https://github.com/alanchn31/multi-agent-code-review.git
