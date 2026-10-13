@@ -71,6 +71,53 @@ async def run(harness):
     return await harness.core.run_task("Implement solve with tests", mock_mode=True)
 
 
+def codex_review_live_harness(harness, monkeypatch):
+    harness.core.policy.reviewer_agent = "codex_cli"
+    monkeypatch.setattr(harness.core, "_get_reviewer", lambda **kwargs: harness.reviewer)
+    original = harness.primary.execute.side_effect
+
+    async def generate(prompt, context=None):
+        result = await original(prompt, context)
+        result.metadata["mock"] = False
+        return result
+
+    harness.primary.execute.side_effect = generate
+
+
+@pytest.mark.asyncio
+async def test_known_codex_reviewer_quota_defers_without_call(harness, monkeypatch):
+    codex_review_live_harness(harness, monkeypatch)
+    harness.core.codex_guard.set_quota_state("EXHAUSTED")
+    task = await harness.core.run_task("Implement solve with tests", mock_mode=False)
+    assert task.state == "WAITING_REVIEW"
+    harness.reviewer.execute.assert_not_called()
+    audit = harness.session.exec(select(PendingCodexAudit).where(PendingCodexAudit.task_id == task.task_id)).one()
+    evidence = harness.session.exec(select(PendingAuditContext).where(PendingAuditContext.audit_id == audit.audit_id)).one()
+    assert audit.commit_sha == "b" * 40 and audit.severity == "P1"
+    assert evidence.test_summary == "1 passed" and evidence.worktree_path == task.worktree_path
+
+
+@pytest.mark.asyncio
+async def test_actual_codex_reviewer_quota_error_preserves_evidence(harness, monkeypatch):
+    codex_review_live_harness(harness, monkeypatch)
+    harness.reviewer.execute.side_effect = CodexQuotaExhaustedError("Explicit weekly usage limit reached")
+    task = await harness.core.run_task("Implement solve with tests", mock_mode=False)
+    assert task.state == "WAITING_REVIEW"
+    assert harness.core.codex_guard.state == "EXHAUSTED"
+    assert task.has_pending_codex_audit
+
+
+@pytest.mark.asyncio
+async def test_simulated_reviewer_quota_cannot_change_real_guard(harness, monkeypatch):
+    harness.core.policy.reviewer_agent = "codex_cli"
+    monkeypatch.setattr(harness.core, "_get_reviewer", lambda **kwargs: harness.reviewer)
+    harness.reviewer.execute.side_effect = CodexQuotaExhaustedError("Simulated weekly usage limit reached")
+    task = await run(harness)
+    assert task.state != "SUCCESS"
+    assert harness.core.codex_guard.state == "READY"
+    assert not task.has_pending_codex_audit
+
+
 @pytest.mark.asyncio
 async def test_failed_developer_cannot_deliver(harness):
     harness.primary.execute.side_effect = None
