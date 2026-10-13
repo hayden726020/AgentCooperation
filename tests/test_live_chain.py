@@ -17,6 +17,8 @@ async def test_fixed_verifier_copies_only_implementation_and_filters_environment
         verifier = kwargs["cwd"]
         assert not (verifier / "conftest.py").exists()
         assert (verifier / "test_acceptance.py").read_text(encoding="utf-8") == live_chain.ACCEPTANCE
+        assert command[command.index("-c") + 1] == str(verifier / "pytest.ini")
+        assert (verifier / "pytest.ini").read_text(encoding="utf-8") == "[pytest]\n"
         return SubprocResult(command, 0, "26 passed in 0.1s", "", 0.1)
 
     monkeypatch.setattr(live_chain, "run_async_command", execute, raising=False)
