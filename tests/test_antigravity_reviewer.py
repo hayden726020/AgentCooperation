@@ -2,8 +2,13 @@
 
 import importlib
 import json
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+import yaml
+
+from execution.subproc import SubprocResult
 
 
 def adapter():
@@ -16,7 +21,7 @@ def verdict():
 
 
 def output(result):
-    return json.dumps({"event": "init"}) + "\n" + json.dumps({"event": "result", "result": result}) + "\n"
+    return json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": []}}) + "\n" + json.dumps({"event": "result", "result": result}) + "\n"
 
 
 def test_structured_success_envelope_is_validated():
@@ -35,3 +40,71 @@ def test_structured_success_envelope_is_validated():
 def test_incomplete_or_ambiguous_result_cannot_approve(raw):
     with pytest.raises(ValueError):
         adapter().parse_antigravity_review(raw)
+
+
+@pytest.mark.parametrize("init", [{"tools": ["write_to_file"]}, {"tools": []},
+                                   {"agent": "orchestrator-readonly-reviewer"}])
+def test_missing_or_unsafe_agent_initialization_cannot_approve(init):
+    raw = output({"status": "SUCCESS", "structured_output": verdict()}).splitlines()
+    raw[0] = json.dumps({"event": "init", "init": init})
+    with pytest.raises(ValueError):
+        adapter().parse_antigravity_review("\n".join(raw))
+
+
+@pytest.mark.asyncio
+async def test_review_uses_isolated_tool_free_agent_and_ndjson_stdin(monkeypatch, tmp_path):
+    module = adapter()
+    verification = AsyncMock()
+    monkeypatch.setattr(module.CodexExpert, "_verify_expected_head", verification)
+    requirement = "中文 & | %PATH%\n" * 3000
+
+    async def cli(command, **kwargs):
+        root = kwargs["cwd"]
+        assert root != tmp_path
+        agent = root / ".agents/agents/orchestrator-readonly-reviewer.md"
+        profile = yaml.safe_load(agent.read_text(encoding="utf-8").split("---")[1])
+        assert profile["tools"] == []
+        assert profile["mcpServers"] == []
+        assert profile["skills"] == [] and profile["plugins"] == []
+        assert profile["commandExecutionPolicy"] == "off"
+        assert profile["mainAgent"] is True and profile["subagent"] is False
+        message = json.loads(kwargs["input_text"])
+        assert message["event"] == "user"
+        assert requirement in message["message"]["content"]
+        assert requirement not in " ".join(command)
+        assert "-p" not in command and "--print" not in command
+        assert command[command.index("--agent") + 1] == profile["name"]
+        assert "--disable-slash-commands" in command
+        assert "--dangerously-skip-permissions" not in command
+        assert kwargs["env"] == {}
+        return SubprocResult(command, 0, output({"status": "SUCCESS", "structured_output": verdict()}), "", 0)
+
+    monkeypatch.setattr(module, "run_async_command", cli)
+    result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
+        "Review", {"worktree_path": tmp_path, "requirement": requirement, "expected_commit_sha": "a" * 40},
+    )
+    assert result.success
+    assert verification.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_review_requires_immutable_commit_before_model_call(monkeypatch, tmp_path):
+    module = adapter()
+    command = AsyncMock()
+    monkeypatch.setattr(module, "run_async_command", command)
+    result = await module.AntigravityReviewer().execute("Review", {"worktree_path": tmp_path})
+    assert not result.success and "commit" in result.error
+    command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_changed_checkout_rejects_even_valid_verdict(monkeypatch, tmp_path):
+    module = adapter()
+    monkeypatch.setattr(module.CodexExpert, "_verify_expected_head", AsyncMock(side_effect=[None, ValueError("checkout changed")]))
+    monkeypatch.setattr(module, "run_async_command", AsyncMock(return_value=SubprocResult(
+        [], 0, output({"status": "SUCCESS", "structured_output": verdict()}), "", 0,
+    )))
+    result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
+        "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40},
+    )
+    assert not result.success and "checkout changed" in result.error
