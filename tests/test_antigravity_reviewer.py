@@ -14,13 +14,18 @@ def adapter():
     return importlib.import_module("agents.antigravity_reviewer")
 
 
+@pytest.fixture(autouse=True)
+def no_machine_proxy(monkeypatch):
+    monkeypatch.setattr(adapter(), "get_cli_proxy_env", lambda: {})
+
+
 def verdict():
     return {"approved": True, "severity": "P3", "summary": "fixture",
             "critical_issues": [], "suggestions": []}
 
 
-def output(result):
-    return json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": []}}) + "\n" + json.dumps({"event": "result", "result": result}) + "\n"
+def output(result, model="gemini-3.8-flash-medium"):
+    return json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": model}}) + "\n" + json.dumps({"event": "result", "result": result}) + "\n"
 
 
 def test_structured_success_envelope_is_validated():
@@ -106,7 +111,7 @@ async def test_review_uses_isolated_tool_free_agent_and_ndjson_stdin(monkeypatch
         assert command[command.index("--agent") + 1] == profile["name"]
         assert "--disable-slash-commands" in command
         assert "--dangerously-skip-permissions" not in command
-        assert kwargs["env"] == {}
+        assert kwargs["env"] == {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
         return SubprocResult(command, 0, output({"status": "SUCCESS", "structured_output": verdict()}), "", 0)
 
     monkeypatch.setattr(module, "run_async_command", cli)
@@ -138,3 +143,16 @@ async def test_changed_checkout_rejects_even_valid_verdict(monkeypatch, tmp_path
         "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40},
     )
     assert not result.success and "checkout changed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_model_mismatch_cannot_approve(monkeypatch, tmp_path):
+    module = adapter()
+    monkeypatch.setattr(module.CodexExpert, "_verify_expected_head", AsyncMock())
+    monkeypatch.setattr(module, "run_async_command", AsyncMock(return_value=SubprocResult(
+        [], 0, output({"status": "SUCCESS", "structured_output": verdict()}, model="unexpected-model"), "", 0,
+    )))
+    result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
+        "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40},
+    )
+    assert not result.success and "model" in result.error
