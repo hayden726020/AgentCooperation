@@ -30,6 +30,13 @@ def test_default_reviewer_uses_available_subscription_route():
     assert settings.load_policy().reviewer_agent == "antigravity_cli"
 
 
+def test_default_antigravity_model_matches_selected_effort():
+    from config.settings import AppSettings
+    defaults = AppSettings(_env_file=None)
+    assert defaults.antigravity_review_model == "gemini-3.8-flash-low"
+    assert defaults.antigravity_review_effort == "low"
+
+
 @pytest.mark.asyncio
 async def test_codex_reviewer_forwards_all_evidence_and_binds_commit(monkeypatch, tmp_path):
     from agents.base import AgentResult
