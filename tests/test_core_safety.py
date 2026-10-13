@@ -11,7 +11,7 @@ import orchestrator.core as core_module
 from agents.base import AgentResult
 from agents.codex_expert import CodexQuotaExhaustedError
 from execution.test_runner import TestResult as RunResult
-from storage.models import PendingCodexAudit, PendingAuditContext, Task
+from storage.models import ExecutionLog, PendingCodexAudit, PendingAuditContext, Task
 
 
 @pytest.fixture
@@ -116,6 +116,16 @@ async def test_simulated_reviewer_quota_cannot_change_real_guard(harness, monkey
     assert task.state != "SUCCESS"
     assert harness.core.codex_guard.state == "READY"
     assert not task.has_pending_codex_audit
+
+
+@pytest.mark.asyncio
+async def test_review_log_records_actual_reported_model(harness):
+    harness.reviewer.execute.return_value.metadata["review_model"] = "gemini-3.8-flash-medium"
+    task = await run(harness)
+    log = harness.session.exec(select(ExecutionLog).where(
+        ExecutionLog.task_id == task.task_id, ExecutionLog.agent_role == "REVIEWER",
+    )).one()
+    assert log.agent_model == "gemini-3.8-flash-medium"
 
 
 @pytest.mark.asyncio
