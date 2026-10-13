@@ -58,7 +58,7 @@ class ExecutionConfig(BaseModel):
 
 class PolicyConfig(BaseModel):
     primary_agent: Literal["glm", "deepseek"] = "glm"
-    reviewer_agent: str = "gemini_cli"
+    reviewer_agent: Literal["gemini_cli", "antigravity_cli", "codex_cli"] = "codex_cli"
     expert_agent: str = "codex_cli"
     models: dict[str, ModelPricing] = Field(default_factory=dict)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
@@ -87,9 +87,13 @@ class AppSettings(BaseSettings):
     gemini_cli_cmd: str = "gemini"
     codex_cli_cmd: str = "codex"
     opencode_cli_cmd: str = "opencode"
+    antigravity_cli_cmd: str = "agy"
+    antigravity_review_model: str = "gemini-3.8-flash-medium"
+    antigravity_review_effort: Literal["low", "medium", "high"] = "low"
     gemini_cli_argv_prefix: List[str] = Field(default_factory=list)
     codex_cli_argv_prefix: List[str] = Field(default_factory=list)
     opencode_cli_argv_prefix: List[str] = Field(default_factory=list)
+    antigravity_cli_argv_prefix: List[str] = Field(default_factory=list)
 
     # SQLite Database
     sqlite_db_path: str = "data/agent_orchestrator.db"
@@ -114,7 +118,7 @@ class AppSettings(BaseSettings):
 
         return PolicyConfig(
             primary_agent=agents_data.get("primary", "glm"),
-            reviewer_agent=agents_data.get("reviewer", "gemini_cli"),
+            reviewer_agent=agents_data.get("reviewer", "codex_cli"),
             expert_agent=agents_data.get("expert", "codex_cli"),
             models=models_data,
             budget=budget_data,

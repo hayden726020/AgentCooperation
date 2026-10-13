@@ -13,6 +13,7 @@ from sqlmodel import Session, select
 from agents.base import AgentResult
 from agents.codex_expert import CodexExpert, CodexQuotaExhaustedError
 from agents.gemini_reviewer import GeminiReviewer
+from agents.codex_reviewer import CodexReviewer
 from config.settings import settings
 from execution.test_runner import TestRunner
 from execution.worktree import WorktreeManager
@@ -36,6 +37,16 @@ class OrchestratorCore:
 
     def _session(self):
         return provide_session(self.session)
+
+    def _get_reviewer(self, mock_mode=False):
+        if self.policy.reviewer_agent == "gemini_cli":
+            return GeminiReviewer(mock_mode=mock_mode)
+        if self.policy.reviewer_agent == "codex_cli":
+            return CodexReviewer(mock_mode=mock_mode)
+        if self.policy.reviewer_agent == "antigravity_cli":
+            from agents.antigravity_reviewer import AntigravityReviewer
+            return AntigravityReviewer(mock_mode=mock_mode)
+        raise ValueError(f"Unsupported independent reviewer: {self.policy.reviewer_agent}")
 
     def _log_step(self, task_id, step_name, role, model, result=None, *, status=None, error=None):
         result = result or AgentResult(success=not error, content="", error=error)
@@ -178,7 +189,7 @@ class OrchestratorCore:
 
         try:
             primary = SingleEngineSlotEnforcer(self.policy).get_primary_agent(model_name, mock_mode=mock_mode)
-            reviewer = GeminiReviewer(mock_mode=mock_mode)
+            reviewer = self._get_reviewer(mock_mode=mock_mode)
             expert = CodexExpert(mock_mode=mock_mode)
             worktree = (await self.worktree_mgr.create_worktree(task_id)).resolve()
             base_ref = await self.worktree_mgr.get_base_ref(worktree)
@@ -229,8 +240,10 @@ class OrchestratorCore:
                     review_result = await reviewer.execute("Review requirements, code and actual test evidence.", context={
                         "worktree_path": worktree, "git_diff": diff, "test_summary": test_result.raw_output,
                         "requirement": requirement,
+                        "expected_commit_sha": checkpoint,
                     })
-                    self._log_step(task_id, "Gemini Review", "REVIEWER", "Gemini-CLI", review_result)
+                    reviewer_model = getattr(reviewer, "model_name", self.policy.reviewer_agent)
+                    self._log_step(task_id, f"{reviewer_model} Review", "REVIEWER", reviewer_model, review_result)
                     if not review_result.success:
                         raise RuntimeError(f"Independent review failed: {review_result.error}")
                     last_review = review_result.metadata.get("review")

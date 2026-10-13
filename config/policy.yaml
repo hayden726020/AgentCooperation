@@ -1,6 +1,6 @@
 agents:
   primary: "glm"          # 默认主力："glm" 或 "deepseek"（互斥二选一）
-  reviewer: "gemini_cli"  # 独立复核（本地订阅 CLI）
+  reviewer: "codex_cli"  # Google 当前地区不可用；也可显式选择 antigravity_cli 或 gemini_cli
   expert: "codex_cli"     # 架构/难题专家（本地订阅 CLI）
 
 models:

@@ -52,6 +52,7 @@ def harness(tmp_path, monkeypatch):
     runner.run = test_run
     monkeypatch.setattr(core_module, "TestRunner", lambda *args, **kwargs: runner)
     core = core_module.OrchestratorCore(repo_root=tmp_path, session=session)
+    core.policy.reviewer_agent = "gemini_cli"  # Bind the intentionally fake Gemini fixture.
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     core.worktree_mgr = SimpleNamespace(
