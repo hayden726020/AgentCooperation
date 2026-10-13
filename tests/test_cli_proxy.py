@@ -1,6 +1,5 @@
 """CLI proxy inheritance stays explicit and never reaches generated tests."""
 
-import json
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -64,6 +63,29 @@ def test_proxy_authentication_redacted_from_diagnostics():
     safe = proxy.redact_cli_proxy_credentials(output, {"HTTPS_PROXY": url})
     assert "fixture-password" not in safe
     assert "fixture-user" not in safe
+
+
+def test_encoded_proxy_password_redacted_when_echoed_separately():
+    url = "http://fixture-user:p%40ssword@localhost:7890"
+    safe = proxy.redact_cli_proxy_credentials(f"Proxy {url}; failed p@ssword", {"HTTPS_PROXY": url})
+    assert "p@ssword" not in safe
+    assert "p%40ssword" not in safe
+
+
+@pytest.mark.parametrize("echoed", ["Fixture%2fSecret%3aWord", "Fixture%2FSecret%3aWord"])
+def test_encoded_proxy_password_redacts_percent_hex_case_variants(echoed):
+    url = "http://fixture-user:Fixture%2FSecret%3AWord@localhost:7890"
+    safe = proxy.redact_cli_proxy_credentials(f"Authentication failed; password {echoed}", {"HTTPS_PROXY": url})
+    assert echoed not in safe
+    assert "[redacted]" in safe
+
+
+def test_proxy_password_redaction_keeps_ordinary_characters_case_sensitive():
+    url = "http://fixture-user:Fixture%2FSecret@localhost:7890"
+    message = "Unrelated value fixture%2fsecret; password Fixture%2fSecret"
+    safe = proxy.redact_cli_proxy_credentials(message, {"HTTPS_PROXY": url})
+    assert "fixture%2fsecret" in safe
+    assert "Fixture%2fSecret" not in safe
 
 
 def test_windows_registry_is_read_without_auto_configuration(monkeypatch):
