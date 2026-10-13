@@ -2,7 +2,6 @@
 
 import importlib
 import json
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -49,6 +48,37 @@ def test_missing_or_unsafe_agent_initialization_cannot_approve(init):
     raw[0] = json.dumps({"event": "init", "init": init})
     with pytest.raises(ValueError):
         adapter().parse_antigravity_review("\n".join(raw))
+
+
+@pytest.mark.parametrize("extra", [
+    {"event": "step_update", "step_update": {"step_type": "tool", "tool_name": "write_to_file"}},
+    {"event": "step_update", "step_update": {"step_type": "agent_response", "subagent_info": {"subagents": []}}},
+    {"event": "unknown"},
+])
+def test_tool_or_unknown_steps_cannot_approve(extra):
+    raw = output({"status": "SUCCESS", "structured_output": verdict()}).splitlines()
+    raw.insert(1, json.dumps(extra))
+    with pytest.raises(ValueError):
+        adapter().parse_antigravity_review("\n".join(raw))
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_cannot_approve(monkeypatch, tmp_path):
+    module = adapter()
+    monkeypatch.setattr(module.CodexExpert, "_verify_expected_head", AsyncMock())
+    monkeypatch.setattr(module, "run_async_command", AsyncMock(return_value=SubprocResult(
+        [], 1, "", "location unsupported", 0,
+    )))
+    result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
+        "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40},
+    )
+    assert not result.success and "location unsupported" in result.error
+
+
+@pytest.mark.asyncio
+async def test_explicit_mock_is_identified():
+    result = await adapter().AntigravityReviewer(mock_mode=True).execute("Review")
+    assert result.success and result.metadata["mock"] is True
 
 
 @pytest.mark.asyncio

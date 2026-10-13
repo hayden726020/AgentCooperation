@@ -24,6 +24,12 @@ def test_unknown_reviewer_configuration_is_rejected():
         PolicyConfig(reviewer_agent="unavailable_provider")
 
 
+def test_default_reviewer_uses_available_subscription_route():
+    from config.settings import settings
+    assert PolicyConfig().reviewer_agent == "codex_cli"
+    assert settings.load_policy().reviewer_agent == "codex_cli"
+
+
 @pytest.mark.asyncio
 async def test_codex_reviewer_forwards_all_evidence_and_binds_commit(monkeypatch, tmp_path):
     from agents.base import AgentResult
