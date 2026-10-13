@@ -127,6 +127,33 @@ async def test_context_output_limit_is_used_for_the_call_and_reservation(monkeyp
     assert create.call_args.kwargs["max_tokens"] == 8192
 
 
+@pytest.mark.parametrize("model_key,expected", [
+    ("deepseek", {"thinking": {"type": "disabled"}}),
+    ("glm", {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}),
+])
+@pytest.mark.asyncio
+async def test_provider_thinking_options_leave_room_for_deliverable_content(monkeypatch, model_key, expected):
+    agent, create, _ = real_agent(monkeypatch, "fixture", SimpleNamespace(prompt_tokens=10, completion_tokens=5))
+    agent.model_key = model_key
+    answer = await agent.execute("fixture", {"max_output_tokens": 512})
+    assert answer.success
+    assert create.call_args.kwargs["extra_body"] == expected
+    assert create.call_args.kwargs["max_tokens"] == 512
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_response_never_becomes_a_deliverable(monkeypatch, tmp_path):
+    agent, create, _ = real_agent(monkeypatch, "", SimpleNamespace(prompt_tokens=10, completion_tokens=512))
+    create.return_value.choices[0].message.reasoning_content = "```python:solution.py\nunsafe = True\n```"
+    answer = await agent.execute("fixture", {"worktree_path": tmp_path, "max_output_tokens": 512})
+    assert not answer.success
+    assert answer.content == ""
+    assert answer.completion_tokens == 512
+    assert answer.cost_cny > 0
+    assert answer.metadata["usage_known"]
+    assert not (tmp_path / "solution.py").exists()
+
+
 @pytest.mark.asyncio
 async def test_unknown_api_failure_keeps_cost_and_redacts_key(monkeypatch):
     agent, create, _ = real_agent(monkeypatch, "fixture", None)
