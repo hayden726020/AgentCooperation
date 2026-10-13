@@ -164,9 +164,10 @@ async def test_changed_checkout_rejects_even_valid_verdict(monkeypatch, tmp_path
 async def test_model_mismatch_cannot_approve(monkeypatch, tmp_path):
     module = adapter()
     monkeypatch.setattr(module.CodexExpert, "_verify_expected_head", AsyncMock())
-    monkeypatch.setattr(module, "run_async_command", AsyncMock(return_value=SubprocResult(
-        [], 0, output({"status": "SUCCESS", "structured_output": verdict()}, model="unexpected-model"), "", 0,
-    )))
+    async def cli(command, **kwargs):
+        return SubprocResult(command, 0, output({"status": "SUCCESS", "structured_output": verdict()},
+                            model="unexpected-model", cwd=kwargs["cwd"]), "", 0)
+    monkeypatch.setattr(module, "run_async_command", cli)
     result = await module.AntigravityReviewer(cli_cmd="fixture").execute(
         "Review", {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40},
     )
@@ -196,3 +197,41 @@ def test_standalone_parser_rejects_full_tool_registry_without_policy_proof():
     raw = output({"status": "SUCCESS", "structured_output": verdict()}, tools=["write_to_file"])
     with pytest.raises(ValueError):
         adapter().parse_antigravity_review(raw)
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_deny_policy_verification_accepts_equivalent_cli_serialization(tmp_path, sparse):
+    module = adapter()
+    expected = json.dumps(module.REVIEW_DENY_SETTINGS, sort_keys=True).encode("utf-8")
+    rewritten = json.loads(expected)
+    rewritten["permissions"]["deny"].reverse()
+    rewritten["selectedModel"] = "gemini-3.8-flash-low"
+    if sparse:
+        rewritten.pop("toolPermission")
+        rewritten.pop("allowNonWorkspaceAccess")
+        rewritten["permissions"].pop("allow")
+        rewritten["permissions"].pop("ask")
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(rewritten, indent=2), encoding="utf-8")
+    module._verify_deny_policy(path, expected)
+
+
+@pytest.mark.parametrize("mutation", ["missing_deny", "weaker_deny", "allow", "ask", "auto_approve", "external_access"])
+def test_deny_policy_verification_rejects_permission_weakening(tmp_path, mutation):
+    module = adapter()
+    expected = json.dumps(module.REVIEW_DENY_SETTINGS, sort_keys=True).encode("utf-8")
+    changed = json.loads(expected)
+    if mutation == "missing_deny":
+        changed.pop("permissions")
+    elif mutation == "weaker_deny":
+        changed["permissions"]["deny"].pop()
+    elif mutation in {"allow", "ask"}:
+        changed["permissions"][mutation] = ["write_file(*)"]
+    elif mutation == "auto_approve":
+        changed["toolPermission"] = "always-proceed"
+    else:
+        changed["allowNonWorkspaceAccess"] = True
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ValueError):
+        module._verify_deny_policy(path, expected)
