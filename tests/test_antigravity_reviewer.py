@@ -39,9 +39,31 @@ def test_structured_success_envelope_is_validated():
     assert review == verdict()
 
 
+def test_response_fallback_review_envelope_is_validated():
+    review = adapter().parse_antigravity_review(output({
+        "status": "SUCCESS", "response": json.dumps(verdict()),
+    }))
+    assert review == verdict()
+
+
+def test_response_fenced_json_is_validated():
+    review = adapter().parse_antigravity_review(output({
+        "status": "SUCCESS", "response": f"```json\n{json.dumps(verdict())}\n```",
+    }))
+    assert review == verdict()
+
+
 @pytest.mark.parametrize("raw", [
     "", "not JSON\n", output({"status": "FAILED", "structured_output": verdict()}),
-    output({"status": "SUCCESS", "response": json.dumps(verdict())}),
+    output({"status": "FAILED", "response": json.dumps(verdict())}),
+    output({"status": "SUCCESS"}),
+    output({"status": "SUCCESS", "response": ""}),
+    output({"status": "SUCCESS", "response": "not valid json"}),
+    output({"status": "SUCCESS", "response": json.dumps({**verdict(), "approved": "true"})}),
+    output({"status": "SUCCESS", "response": json.dumps({**verdict(), "severity": "INVALID"})}),
+    output({"status": "SUCCESS", "response": json.dumps({**verdict(), "summary": 123})}),
+    output({"status": "SUCCESS", "response": json.dumps({**verdict(), "critical_issues": "not_a_list"})}),
+    output({"status": "SUCCESS", "response": json.dumps({**verdict(), "suggestions": [123]})}),
     output({"status": "SUCCESS", "structured_output": {**verdict(), "approved": "true"}}),
     output({"status": "SUCCESS", "structured_output": verdict()}) * 2,
 ])

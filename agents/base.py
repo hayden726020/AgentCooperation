@@ -52,14 +52,63 @@ def redact_credentials(text: str, credential_env: dict[str, str]) -> str:
     return text
 
 
+def redact_review_credentials(review: dict[str, Any], credential_env: dict[str, str]) -> dict[str, Any]:
+    """Sanitize validated, decoded review prose without changing decision types."""
+    from execution.proxy import redact_cli_proxy_credentials
+
+    api_credentials = {key: value for key, value in credential_env.items()
+                       if key.upper().endswith(("_API_KEY", "_TOKEN"))}
+
+    def safe_text(value: str) -> str:
+        return redact_cli_proxy_credentials(redact_credentials(value, api_credentials), credential_env)
+
+    return {
+        "approved": review["approved"], "severity": review["severity"],
+        "summary": safe_text(review["summary"]),
+        "critical_issues": [safe_text(value) for value in review["critical_issues"]],
+        "suggestions": [safe_text(value) for value in review["suggestions"]],
+    }
+
+
 def parse_review_output(raw_text: str) -> dict[str, Any]:
     """Unwrap CLI envelopes and validate every field needed for a review decision."""
     value: Any = raw_text
     for _ in range(4):
         if isinstance(value, str):
             text = value.strip()
-            fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-            value = json.loads(fenced.group(1) if fenced else text)
+            blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+            candidate = None
+            for block in blocks:
+                try:
+                    parsed = json.loads(block.strip())
+                    if isinstance(parsed, dict) and "approved" in parsed:
+                        candidate = parsed
+                        break
+                except Exception:
+                    start_idx = block.find("{")
+                    if start_idx != -1:
+                        try:
+                            obj, _ = json.JSONDecoder().raw_decode(block, start_idx)
+                            if isinstance(obj, dict) and "approved" in obj:
+                                candidate = obj
+                                break
+                        except Exception:
+                            pass
+            if candidate is not None:
+                value = candidate
+            else:
+                try:
+                    value = json.loads(text)
+                except Exception:
+                    start_idx = text.find("{")
+                    if start_idx != -1:
+                        try:
+                            obj, _ = json.JSONDecoder().raw_decode(text, start_idx)
+                            value = obj
+                        except Exception:
+                            raise ValueError("Review output must be a JSON object")
+                    else:
+                        raise ValueError("Review output must be a JSON object")
         if not isinstance(value, dict):
             raise ValueError("Review output must be a JSON object")
         if value.get("error"):
