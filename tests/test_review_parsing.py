@@ -223,14 +223,94 @@ async def test_antigravity_reviewer_fails_on_conflicting_or_trailing_error(monke
     r1 = valid_review(approved=True, severity="P3", summary="looks good")
     r2 = valid_review(approved=False, severity="P1", summary="bad", critical_issues=["issue"])
     payload = f"```json\n{json.dumps(r1)}\n```\n```json\n{json.dumps(r2)}\n```"
-    stream = (
-        json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-low", "cwd": str(tmp_path / "workspace")}}) + "\n"
-        + json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": payload}}) + "\n"
-    )
-    command = AsyncMock(return_value=SubprocResult(["agy"], 0, stream, "", 0))
-    monkeypatch.setattr("agents.antigravity_reviewer.run_async_command", command)
+
+    async def fake_command(cmd, cwd=None, env=None, timeout=None, input_text=None):
+        stream = (
+            json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-low", "cwd": str(cwd)}}) + "\n"
+            + json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": payload}}) + "\n"
+        )
+        return SubprocResult(["agy"], 0, stream, "", 0)
+
+    monkeypatch.setattr("agents.antigravity_reviewer.run_async_command", fake_command)
     monkeypatch.setattr(CodexExpert, "_verify_expected_head", AsyncMock())
     result = await AntigravityReviewer().execute("fixture", {
         "worktree_path": tmp_path, "expected_commit_sha": "a" * 40,
     })
     assert result.success is False
+    assert "conflicting" in result.error.lower() or "multiple" in result.error.lower()
+
+
+# 13. Candidate boolean vs numeric equality strict distinction
+@pytest.mark.parametrize("cand1_approved,cand2_approved", [
+    (True, 1),
+    (1, True),
+    (True, 1.0),
+    (1.0, True),
+    (False, 0),
+    (0, False),
+    (False, 0.0),
+    (0.0, False),
+])
+def test_candidate_boolean_numeric_strict_distinction_rejected(cand1_approved, cand2_approved):
+    r1 = valid_review()
+    r1["approved"] = cand1_approved
+    r2 = valid_review()
+    r2["approved"] = cand2_approved
+    text = f"```json\n{json.dumps(r1)}\n```\n```json\n{json.dumps(r2)}\n```"
+    with pytest.raises(ValueError):
+        parse_review_output(text)
+
+
+# 14. Valid JSON with Markdown triple backticks inside strings
+def test_pure_json_with_code_blocks_in_summary_accepted():
+    summary_with_code = "Use the following snippet:\n```python\nprint('hello')\n```\nand run pytest."
+    review = valid_review(summary=summary_with_code)
+    text = json.dumps(review)
+    parsed = parse_review_output(text)
+    assert parsed == review
+
+
+def test_fenced_json_with_code_blocks_in_summary_accepted():
+    summary_with_code = "Use the following snippet:\n```python\nprint('hello')\n```\nand run pytest."
+    review = valid_review(summary=summary_with_code)
+    text = f"```json\n{json.dumps(review)}\n```"
+    parsed = parse_review_output(text)
+    assert parsed == review
+
+
+def test_json_with_odd_backticks_in_string_accepted():
+    summary_with_odd_backticks = "Check out ``` for formatting code."
+    review = valid_review(summary=summary_with_odd_backticks)
+    text = json.dumps(review)
+    parsed = parse_review_output(text)
+    assert parsed == review
+
+
+def test_fenced_json_with_code_blocks_in_suggestions_accepted():
+    sugg = ["Query using ```sql\nSELECT * FROM users;\n``` to check records."]
+    review = valid_review(suggestions=sugg)
+    text = f"```json\n{json.dumps(review)}\n```"
+    parsed = parse_review_output(text)
+    assert parsed == review
+
+
+# 15. Antigravity event stream duplicate keys rejection
+def test_antigravity_event_stream_duplicate_status_key_rejected():
+    from agents.antigravity_reviewer import parse_antigravity_review
+    stream = (
+        '{"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-low"}}\n'
+        '{"event": "result", "result": {"status": "ERROR", "status": "SUCCESS", "structured_output": {"approved": true, "severity": "P3", "summary": "ok", "critical_issues": [], "suggestions": []}}}\n'
+    )
+    with pytest.raises(ValueError, match="(?i)duplicate"):
+        parse_antigravity_review(stream)
+
+
+def test_antigravity_event_stream_duplicate_approved_key_in_structured_output_rejected():
+    from agents.antigravity_reviewer import parse_antigravity_review
+    stream = (
+        '{"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-low"}}\n'
+        '{"event": "result", "result": {"status": "SUCCESS", "structured_output": {"approved": false, "approved": true, "severity": "P3", "summary": "ok", "critical_issues": [], "suggestions": []}}}\n'
+    )
+    with pytest.raises(ValueError, match="(?i)duplicate"):
+        parse_antigravity_review(stream)
+

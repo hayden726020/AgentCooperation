@@ -80,7 +80,32 @@ def _unique_json_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 _STRICT_JSON_DECODER = json.JSONDecoder(object_pairs_hook=_unique_json_pairs_hook)
-_FENCE_REGEX = re.compile(r"```(?:[a-zA-Z0-9_-]+)?\r?\n?([\s\S]*?)```")
+
+
+def strict_json_loads(text: str) -> Any:
+    """Decode a JSON string, enforcing duplicate key rejection and consuming all content."""
+    s = text.strip()
+    if not s:
+        raise ValueError("Empty JSON content")
+    res, idx = _STRICT_JSON_DECODER.raw_decode(s)
+    if s[idx:].strip():
+        raise ValueError(f"Abnormal unconsumed trailing content: {s[idx:idx+30]!r}")
+    return res
+
+
+def _strict_equal(a: Any, b: Any) -> bool:
+    """Type-aware strict equality that distinguishes bool from int/float, etc."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_strict_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        return all(_strict_equal(x, y) for x, y in zip(a, b))
+    return a == b
 
 
 def _parse_json_stream(s: str) -> list[Any]:
@@ -113,45 +138,82 @@ def _parse_json_stream(s: str) -> list[Any]:
 
 def _extract_candidate_objects(text: str) -> list[Any]:
     """Extract and strictly validate all candidate JSON objects from plain or fenced text."""
-    text = text.strip()
-    if not text:
+    s = text.strip()
+    if not s:
         raise ValueError("Review output is empty")
 
-    fence_count = text.count("```")
-    if fence_count > 0:
-        if fence_count % 2 != 0:
-            raise ValueError("Unclosed or malformed Markdown code fence in review output")
-        matches = list(_FENCE_REGEX.finditer(text))
-        if len(matches) * 2 != fence_count:
-            raise ValueError("Malformed or unmatched Markdown code fences in review output")
+    # 1. Prioritize pure JSON parsing if text does not start with a Markdown code fence
+    if not s.startswith("```"):
+        try:
+            return _parse_json_stream(s)
+        except Exception:
+            if "```" not in s:
+                raise
 
-        pre_text = text[:matches[0].start()].strip()
-        if pre_text:
-            if any(c in pre_text for c in "{}[]"):
-                raise ValueError("Review peripheral text contains un-fenced JSON delimiters")
-            if re.search(r"\b(error|failed|exception)\b", pre_text, re.IGNORECASE):
-                raise ValueError(f"Review preamble reports an error: {pre_text[:100]!r}")
-            if len(pre_text) > 300:
-                raise ValueError("Unexpectedly large preamble before review fence")
+    # 2. Markdown fenced content (either starts with ``` or has preamble before ```)
+    fence_start = s.find("```")
+    if fence_start == -1:
+        return _parse_json_stream(s)
 
-        for i in range(len(matches) - 1):
-            mid_text = text[matches[i].end():matches[i + 1].start()].strip()
-            if mid_text:
-                raise ValueError(f"Abnormal unconsumed content between review fences: {mid_text[:100]!r}")
+    pre_text = s[:fence_start].strip()
+    if pre_text:
+        if any(c in pre_text for c in "{}[]"):
+            raise ValueError("Review peripheral text contains un-fenced JSON delimiters")
+        if re.search(r"\b(error|failed|exception)\b", pre_text, re.IGNORECASE):
+            raise ValueError(f"Review preamble reports an error: {pre_text[:100]!r}")
+        if len(pre_text) > 300:
+            raise ValueError("Unexpectedly large preamble before review fence")
 
-        post_text = text[matches[-1].end():].strip()
-        if post_text:
-            raise ValueError(f"Abnormal trailing content after review fence: {post_text[:100]!r}")
+    idx = fence_start
+    length = len(s)
+    all_objects: list[Any] = []
 
-        all_objects: list[Any] = []
-        for m in matches:
-            body = m.group(1).strip()
-            if not body:
-                raise ValueError("Empty review code fence in review output")
-            all_objects.extend(_parse_json_stream(body))
-        return all_objects
-    else:
-        return _parse_json_stream(text)
+    while idx < length:
+        if not s[idx:].startswith("```"):
+            raise ValueError(f"Abnormal unconsumed content between review fences: {s[idx:idx+50]!r}")
+
+        open_match = re.match(r"^```(?:[a-zA-Z0-9_-]+)?\r?\n?", s[idx:])
+        if not open_match:
+            raise ValueError("Malformed opening Markdown code fence")
+        idx += open_match.end()
+
+        fence_had_object = False
+        while idx < length:
+            while idx < length and s[idx].isspace():
+                idx += 1
+            if idx >= length:
+                raise ValueError("Unclosed Markdown code fence in review output")
+            if s[idx:idx + 3] == "```":
+                break
+            if s[idx] not in ("{", "["):
+                raise ValueError(f"Abnormal unconsumed content inside review fence: {s[idx:idx+30]!r}")
+            try:
+                obj, end_idx = _STRICT_JSON_DECODER.raw_decode(s, idx)
+            except Exception as exc:
+                raise ValueError(f"Malformed or truncated JSON: {exc}") from exc
+            all_objects.append(obj)
+            fence_had_object = True
+            idx = end_idx
+
+        if not fence_had_object:
+            raise ValueError("Empty review code fence in review output")
+
+        while idx < length and s[idx].isspace():
+            idx += 1
+        if idx >= length or s[idx:idx + 3] != "```":
+            raise ValueError("Unclosed Markdown code fence in review output")
+        idx += 3
+
+        while idx < length and s[idx].isspace():
+            idx += 1
+
+        if idx >= length:
+            break
+
+        if not s[idx:].startswith("```"):
+            raise ValueError(f"Abnormal trailing content after review fence: {s[idx:idx+50]!r}")
+
+    return all_objects
 
 
 def _validate_review_verdict(value: dict[str, Any]) -> dict[str, Any]:
@@ -186,8 +248,13 @@ def parse_review_output(raw_text: str) -> dict[str, Any]:
                     raise ValueError(f"Review CLI reported a trailing error object: {obj.get('error')}")
             if any(not isinstance(obj, dict) for obj in all_objects):
                 raise ValueError("Encountered unexpected non-review JSON entity in review output")
+
+            for obj in all_objects:
+                if "approved" in obj:
+                    _validate_review_verdict(obj)
+
             first_obj = all_objects[0]
-            if any(obj != first_obj for obj in all_objects):
+            if any(not _strict_equal(obj, first_obj) for obj in all_objects):
                 raise ValueError("Multiple conflicting review decisions, trailing objects, or inconsistent entities in output")
             value = first_obj
 
@@ -205,4 +272,5 @@ def parse_review_output(raw_text: str) -> dict[str, Any]:
             raise ValueError("Review output has no review decision")
 
     return _validate_review_verdict(value)
+
 

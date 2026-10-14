@@ -10,7 +10,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agents.base import AgentResult, BaseAgent, parse_review_output, redact_review_credentials, task_directory
+from agents.base import (
+    AgentResult, BaseAgent, parse_review_output, redact_review_credentials,
+    strict_json_loads, task_directory,
+)
 from agents.codex_expert import CodexExpert
 from agents.gemini_reviewer import REVIEW_SCHEMA_PROMPT
 from config.settings import settings
@@ -58,7 +61,10 @@ REVIEW_JSON_SCHEMA = {
 
 def _result_envelope(raw: str, *, deny_policy_verified: bool = False,
                      expected_cwd: Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    try:
+        events = [strict_json_loads(line) for line in raw.splitlines() if line.strip()]
+    except Exception as exc:
+        raise ValueError(f"Antigravity returned invalid event JSON: {exc}") from exc
     if not events or any(not isinstance(event, dict) for event in events):
         raise ValueError("Antigravity returned no valid event stream")
     if events[0].get("event") != "init" or events[-1].get("event") != "result":
@@ -118,15 +124,12 @@ def _verify_deny_policy(path: Path, expected_bytes: bytes) -> None:
     if path.is_symlink() or not path.is_file() or path.resolve(strict=True) != path.absolute():
         raise ValueError("Required Antigravity deny-all policy is missing or aliased")
 
-    def unique_fields(pairs):
-        value = {}
-        for key, item in pairs:
-            if key in value:
-                raise ValueError("Antigravity deny-all policy contains ambiguous duplicate settings")
-            value[key] = item
-        return value
-
-    current = json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=unique_fields)
+    try:
+        current = strict_json_loads(path.read_text(encoding="utf-8-sig"))
+    except ValueError as exc:
+        if "duplicate" in str(exc).lower():
+            raise ValueError("Antigravity deny-all policy contains ambiguous duplicate settings") from exc
+        raise
     expected = json.loads(expected_bytes)
     if not isinstance(current, dict):
         raise ValueError("Required Antigravity deny-all policy must be an object")
