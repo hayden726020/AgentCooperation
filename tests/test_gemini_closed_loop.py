@@ -374,6 +374,36 @@ def test_gemini_dev_agent_contract():
     agent = GeminiDevAgent(mock_mode=True)
     assert agent.model_name == "gemini-3.8-flash-high"
     assert agent.role_name == "PRIMARY_DEVELOPER"
+    assert agent.timeout == 900.0
+
+
+def test_closed_loop_uses_policy_model_timeout(mock_git_repo, test_db_session):
+    """The real Gemini developer receives the bounded timeout from policy."""
+    policy = PolicyConfig(execution={"model_timeout_seconds": 1200})
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        policy=policy,
+        reviewer_choice="glm",
+    )
+
+    agent = orchestrator._new_dev_agent(mock_mode=False)
+
+    assert agent.timeout == 1200.0
+
+
+def test_loaded_policy_allows_long_running_gemini_development():
+    """The checked-in production policy must exceed the old five-minute limit."""
+    policy = settings.load_policy()
+
+    assert policy.execution.model_timeout_seconds == 900
+
+
+@pytest.mark.parametrize("timeout", [59, 1801])
+def test_model_timeout_policy_is_bounded(timeout):
+    """Policy must reject both ineffective and effectively unbounded model runs."""
+    with pytest.raises(ValueError):
+        PolicyConfig(execution={"model_timeout_seconds": timeout})
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,7 @@ class GeminiDevAgent(BaseAgent):
         model_name: str = "gemini-3.8-flash-high",
         effort: str = "high",
         mock_mode: bool = False,
-        timeout: float = 300.0,
+        timeout: float = 900.0,
     ):
         super().__init__(role_name="PRIMARY_DEVELOPER", model_name=model_name)
         self.effort = effort

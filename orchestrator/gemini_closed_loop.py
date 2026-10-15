@@ -203,6 +203,13 @@ class GeminiClosedLoopOrchestrator:
             else getattr(self.policy.repair, "max_normal_attempts", 3)
         )
 
+    def _new_dev_agent(self, mock_mode: bool) -> GeminiDevAgent:
+        """Create a Gemini developer with the bounded policy timeout."""
+        return GeminiDevAgent(
+            mock_mode=mock_mode,
+            timeout=float(self.policy.execution.model_timeout_seconds),
+        )
+
     @staticmethod
     def _is_production_session(session: Optional[Session]) -> bool:
         if session is None:
@@ -387,7 +394,7 @@ class GeminiClosedLoopOrchestrator:
             s.commit()
 
         # Instantiate agents if not provided
-        dev = dev_agent or GeminiDevAgent(mock_mode=mock_mode)
+        dev = dev_agent or self._new_dev_agent(mock_mode)
         reviewer = reviewer_agent or FlashReviewer(
             model_key=self.reviewer_choice,
             budget_cfg=self.policy.budget,
@@ -879,7 +886,7 @@ class GeminiClosedLoopOrchestrator:
             raise ValueError(f"Worktree has no git repository metadata: {worktree}")
 
         base_ref = await self.worktree_mgr.get_base_ref(worktree)
-        dev = dev_agent or GeminiDevAgent(mock_mode=mock_mode)
+        dev = dev_agent or self._new_dev_agent(mock_mode)
         rev_choice = "deepseek" if reviewer_model_str and "deepseek" in reviewer_model_str.lower() else self.reviewer_choice
         reviewer = reviewer_agent or FlashReviewer(
             model_key=rev_choice,

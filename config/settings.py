@@ -60,6 +60,7 @@ class RepairConfig(BaseModel):
 
 class ExecutionConfig(BaseModel):
     timeout_seconds: int = 600
+    model_timeout_seconds: int = Field(default=900, ge=60, le=1800)
     git_worktree_base: str = ".worktrees"
     max_output_tokens: int = Field(default=8192, gt=0)
     max_context_tokens: int = Field(default=200000, gt=0)
