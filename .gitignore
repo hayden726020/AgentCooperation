@@ -51,3 +51,13 @@ logs/
 # Local CLI dependencies and live integration workspaces
 .runtime/
 .integration/
+
+# Generated test/coverage artifacts and local recovery snapshots
+.coverage
+.coverage.*
+htmlcov/
+.backup_*/
+
+# Independent local upstream clones; their changes belong to their own repositories
+/hermes-agent/
+/DeepSeekBot/

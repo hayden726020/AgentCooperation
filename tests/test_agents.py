@@ -18,6 +18,12 @@ from config.settings import BudgetConfig, ModelPricing
 from execution.subproc import SubprocResult
 
 
+@pytest.fixture(autouse=True)
+def no_machine_proxy(monkeypatch):
+    monkeypatch.setattr("agents.gemini_reviewer.get_cli_proxy_env", lambda: {})
+    monkeypatch.setattr("agents.codex_expert.get_cli_proxy_env", lambda: {})
+
+
 @pytest.fixture
 def flash() -> FlashApiAgent:
     return FlashApiAgent("glm", ModelPricing(model_id="fixture"), BudgetConfig(), mock_mode=True)
@@ -129,7 +135,7 @@ async def test_context_output_limit_is_used_for_the_call_and_reservation(monkeyp
 
 @pytest.mark.parametrize("model_key,expected", [
     ("deepseek", {"thinking": {"type": "disabled"}}),
-    ("glm", {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}),
+    ("glm", {"thinking": {"type": "enabled"}}),
 ])
 @pytest.mark.asyncio
 async def test_provider_thinking_options_leave_room_for_deliverable_content(monkeypatch, model_key, expected):

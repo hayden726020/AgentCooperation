@@ -1,12 +1,14 @@
+import json
 import os
 import re
 import time
 from pathlib import Path
 from typing import Any
-from agents.base import BaseAgent, AgentResult, parse_review_output, task_directory
+from agents.base import BaseAgent, AgentResult, parse_review_output, redact_review_credentials, task_directory
 from agents.gemini_reviewer import REVIEW_SCHEMA_PROMPT
 from execution.subproc import run_async_command, SubprocResult
 from execution.cli_launcher import build_cli_argv
+from execution.proxy import get_cli_proxy_env, redact_cli_proxy_credentials
 from config.settings import settings
 
 
@@ -92,21 +94,27 @@ class CodexExpert(BaseAgent):
             return self._mock_result(context)
         issue_context = context.get("issue_context", "")
         full_prompt = f"Expert Advice Required:\nContext: {issue_context}\nTask: {prompt}"
+        credential_env: dict[str, str] = {}
         try:
             cwd = task_directory(context)
             await self._verify_expected_head(cwd, context)
             if context.get("structured_review"):
                 full_prompt += f"\n{REVIEW_SCHEMA_PROMPT}"
+            target_model = getattr(settings, "codex_expert_model", "gpt-6.1-sol")
+            if not target_model:
+                raise ValueError("Codex expert model is not configured")
             cmd = build_cli_argv(self.cli_cmd, self.cli_argv_prefix) + [
-                "exec", "--sandbox", "read-only", "--ephemeral", "--color", "never", "-",
+                "exec", "--model", target_model, "--sandbox", "read-only", "--ephemeral", "--color", "never", "-",
             ]
             auth_home = os.getenv("CODEX_HOME")
-            credential_env = {"CODEX_HOME": auth_home} if auth_home else {}
+            credential_env = get_cli_proxy_env()
+            if auth_home:
+                credential_env["CODEX_HOME"] = auth_home
             res: SubprocResult = await run_async_command(
                 cmd, cwd=cwd, env=credential_env, timeout=300.0, input_text=full_prompt,
             )
             duration = time.monotonic() - start_time
-            combined_output = f"{res.stdout}\n{res.stderr}"
+            combined_output = redact_cli_proxy_credentials(f"{res.stdout}\n{res.stderr}", credential_env)
 
             # 检测额度是否耗尽
             if not res.is_success and self.check_is_quota_exhausted(combined_output):
@@ -119,16 +127,18 @@ class CodexExpert(BaseAgent):
                     success=False,
                     content="",
                     duration_s=duration,
-                    error=f"Codex CLI failed (exit {res.exit_code}): {res.stderr[:300]}"
+                    error=f"Codex CLI failed (exit {res.exit_code}): {redact_cli_proxy_credentials(res.stderr, credential_env)[:300]}"
                 )
 
             if not res.stdout.strip():
                 raise ValueError("Codex returned an empty response")
             await self._verify_expected_head(cwd, context)
-            review = parse_review_output(res.stdout) if context.get("structured_review") else None
+            review = (redact_review_credentials(parse_review_output(res.stdout), credential_env)
+                      if context.get("structured_review") else None)
             return AgentResult(
                 success=True,
-                content=res.stdout,
+                content=(json.dumps(review, ensure_ascii=False) if review is not None
+                         else redact_cli_proxy_credentials(res.stdout, credential_env)),
                 cost_cny=0.0,
                 duration_s=duration,
                 metadata={"exit_code": res.exit_code, "mock": False, **({"review": review} if review else {})}
@@ -142,5 +152,5 @@ class CodexExpert(BaseAgent):
                 success=False,
                 content="",
                 duration_s=duration,
-                error=f"Codex call error: {str(e)}"
+                error=redact_cli_proxy_credentials(f"Codex call error: {str(e)}", credential_env)
             )

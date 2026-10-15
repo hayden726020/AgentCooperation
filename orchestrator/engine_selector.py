@@ -20,9 +20,13 @@ class SingleEngineSlotEnforcer:
         chosen_model: Optional[Literal["glm", "deepseek"]] = None,
         mock_mode: bool = False
     ) -> FlashApiAgent:
-        target_key = chosen_model or self.policy.primary_agent
-        if target_key not in ["glm", "deepseek"]:
-            raise ValueError(f"Invalid primary model '{target_key}'. Must be 'glm' or 'deepseek'.")
+        raw_key = str(chosen_model or self.policy.primary_agent).strip().lower()
+        if raw_key in ["glm", "flashx", "glm-5.3-flashx"]:
+            target_key = "glm"
+        elif raw_key in ["deepseek", "v4flash", "deepseek-flash"]:
+            target_key = "deepseek"
+        else:
+            raise ValueError(f"Invalid primary model '{chosen_model}'. Must be 'glm' (flashX) or 'deepseek' (v4flash).")
 
         # 若已激活不同模型，拒绝在同一任务中混杂
         if self._active_model_key is not None and self._active_model_key != target_key:
@@ -41,7 +45,7 @@ class SingleEngineSlotEnforcer:
             from config.settings import ModelPricing
             if target_key == "glm":
                 pricing = ModelPricing(
-                    model_id="glm-5.3-flash",
+                    model_id="glm-5.3-flashx",
                     input_price_per_m_usd=0.15,
                     output_price_per_m_usd=0.50
                 )

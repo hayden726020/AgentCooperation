@@ -16,6 +16,12 @@ from config.settings import settings
 from execution.subproc import SubprocResult, run_async_command
 
 
+@pytest.fixture(autouse=True)
+def no_machine_proxy(monkeypatch):
+    monkeypatch.setattr("agents.codex_expert.get_cli_proxy_env", lambda: {})
+    monkeypatch.setattr("agents.gemini_reviewer.get_cli_proxy_env", lambda: {})
+
+
 def review_output():
     return json.dumps({
         "approved": True, "severity": "P3", "summary": "fixture",

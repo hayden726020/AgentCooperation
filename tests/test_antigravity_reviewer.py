@@ -25,7 +25,7 @@ def verdict():
             "critical_issues": [], "suggestions": []}
 
 
-def output(result, model="gemini-3.8-flash-low", cwd=None, tools=None):
+def output(result, model="gemini-3.8-flash-high", cwd=None, tools=None):
     initialization = {"agent": "orchestrator-readonly-reviewer", "tools": tools or [], "model": model}
     if cwd is not None:
         initialization["cwd"] = str(cwd)
@@ -228,7 +228,7 @@ def test_deny_policy_verification_accepts_equivalent_cli_serialization(tmp_path,
     expected = json.dumps(module.REVIEW_DENY_SETTINGS, sort_keys=True).encode("utf-8")
     rewritten = json.loads(expected)
     rewritten["permissions"]["deny"].reverse()
-    rewritten["selectedModel"] = "gemini-3.8-flash-low"
+    rewritten["selectedModel"] = "gemini-3.8-flash-high"
     if sparse:
         rewritten.pop("toolPermission", None)
         rewritten.pop("allowNonWorkspaceAccess", None)

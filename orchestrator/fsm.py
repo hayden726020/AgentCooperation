@@ -110,6 +110,13 @@ class TaskLifecycleFSM:
             trigger="to_repairing_from_backlog", source="CODEX_BACKLOGGED", dest="REPAIRING"
         )
         self.machine.add_transition(
+            trigger="to_repairing_from_approval", source="WAITING_APPROVAL", dest="REPAIRING",
+            after="increment_repair_attempts"
+        )
+        self.machine.add_transition(
+            trigger="to_testing_from_approval", source="WAITING_APPROVAL", dest="TESTING"
+        )
+        self.machine.add_transition(
             trigger="to_success",
             source="REVIEWING", dest="SUCCESS", conditions=["verified_delivery"]
         )

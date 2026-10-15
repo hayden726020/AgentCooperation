@@ -14,6 +14,12 @@ from sqlmodel import select
 
 from agents.codex_expert import CodexExpert
 from config.settings import settings
+from integrations.multica import (
+    MemoryMulticaClient,
+    MulticaBridge,
+    MulticaIssue,
+    MulticaWorker,
+)
 from orchestrator.core import OrchestratorCore
 from storage.db import get_engine, get_or_create_codex_quota, get_or_create_monthly_spending, get_session
 from storage.models import PendingCodexAudit, Task
@@ -132,6 +138,83 @@ async def execute_task(req, model, mock, title, *, repo_root=None, test_command=
     return task
 
 
+async def execute_multica_issue(issue_id, title, task_req, model, mock, *, repo_root=None, test_command=None, persistence_file=None):
+    persistence_path = Path(persistence_file) if persistence_file else Path("data/multica_board.json")
+    client = MemoryMulticaClient(persistence_file=persistence_path)
+    existing = await client.get_issue(issue_id)
+    if not existing:
+        if not task_req:
+            raise ValueError(f"Issue '{issue_id}' 不存在，请提供 --task 来创建新任务")
+        issue = MulticaIssue(
+            id=issue_id,
+            title=title or issue_id,
+            description=task_req,
+            status="todo",
+            priority="high",
+        )
+        await client.create_issue(issue)
+    else:
+        issue = existing
+        if task_req:
+            issue.description = task_req
+        if title:
+            issue.title = title
+
+    with _core_scope(mock=mock, repo_root=repo_root) as core:
+        bridge = MulticaBridge(client=client, core=core)
+        result = await bridge.run_issue(
+            issue, chosen_model=model, mock_mode=mock, custom_test_cmd=test_command
+        )
+
+    console.print(Panel(
+        f"Multica Issue: {result.issue_id}\n"
+        f"看板状态: {result.multica_status}\n"
+        f"核心状态机: {result.fsm_state}\n"
+        f"开发分支: {result.branch_name}\n"
+        f"总费用估算: ¥{result.total_cost_cny:.5f}\n"
+        f"已回写评论: {len(result.comments_posted)} 条\n"
+        f"最新报告总结: {result.summary}",
+        title="Multica 任务执行完成",
+        border_style="green" if result.multica_status == "done" else "yellow",
+    ))
+    return result
+
+
+async def execute_multica_worker(model, mock, *, repo_root=None, interval=10, max_cycles=None, persistence_file=None):
+    persistence_path = Path(persistence_file) if persistence_file else Path("data/multica_board.json")
+    client = MemoryMulticaClient(persistence_file=persistence_path)
+    console.print(Panel(
+        f"启动 Multica 自动轮询 Worker\n"
+        f"轮询间隔: {interval}秒\n"
+        f"模式: {'显式模拟，使用独立账库' if mock else '真实调用'}\n"
+        f"看板数据文件: {persistence_path}",
+        title="Multica Worker",
+        border_style="cyan",
+    ))
+    with _core_scope(mock=mock, repo_root=repo_root) as core:
+        bridge = MulticaBridge(client=client, core=core)
+        worker = MulticaWorker(bridge=bridge, poll_interval=interval, model=model, mock_mode=mock)
+        await worker.run_forever(max_cycles=max_cycles)
+
+
+def show_multica_board(persistence_file=None):
+    persistence_path = Path(persistence_file) if persistence_file else Path("data/multica_board.json")
+    client = MemoryMulticaClient(persistence_file=persistence_path)
+    issues = list(client._issues.values())
+    if not issues:
+        console.print(f"看板暂无任务：{persistence_path}")
+        return
+    table = Table(title=f"Multica 任务看板 ({persistence_path})")
+    for col in ("Issue ID", "标题", "状态", "优先级", "执行人", "分支"):
+        table.add_column(col)
+    for issue in issues:
+        table.add_row(
+            issue.id, issue.title[:25], issue.status, issue.priority,
+            issue.assignee or "-", issue.branch_name or "-"
+        )
+    console.print(table)
+
+
 def _reset_time(value):
     try:
         result = datetime.fromisoformat(value)
@@ -162,13 +245,72 @@ def main():
     quota.add_argument("--state", required=True, choices=["READY", "RESERVED", "EXHAUSTED", "RECOVERING"])
     quota.add_argument("--reset-at", type=_reset_time, default=None, help="无时区时按北京时间处理")
     quota.add_argument("--mock", action="store_true")
+
+    # Multica integration commands
+    m_run = subparsers.add_parser("multica-run", help="执行 Multica Issue 并同步看板状态")
+    m_run.add_argument("--issue-id", required=True, help="Multica Issue 标识 (如 ISS-101)")
+    m_run.add_argument("--title", default=None, help="任务标题")
+    m_run.add_argument("--task", "-t", default=None, help="任务描述/需求内容")
+    m_run.add_argument("--model", "-m", choices=["glm", "deepseek"], default=None)
+    m_run.add_argument("--mock", action="store_true")
+    m_run.add_argument("--repo-root", type=Path, default=None)
+    m_run.add_argument("--test-command", default=None)
+    m_run.add_argument("--board-file", type=Path, default=None, help="本地持久化看板 JSON 路径")
+
+    m_worker = subparsers.add_parser("multica-worker", help="启动 Multica 待办 Issue 轮询 Worker")
+    m_worker.add_argument("--interval", type=int, default=10, help="轮询间隔(秒)")
+    m_worker.add_argument("--once", action="store_true", help="仅轮询一次后退出")
+    m_worker.add_argument("--model", "-m", choices=["glm", "deepseek"], default=None)
+    m_worker.add_argument("--mock", action="store_true")
+    m_worker.add_argument("--repo-root", type=Path, default=None)
+    m_worker.add_argument("--board-file", type=Path, default=None)
+
+    m_board = subparsers.add_parser("multica-board", help="查看 Multica 任务看板当前状态")
+    m_board.add_argument("--board-file", type=Path, default=None)
+
+    # Web Dashboard command
+    web_parser = subparsers.add_parser("web", help="启动可视化 Web 仪表盘控制台")
+    web_parser.add_argument("--port", "-p", type=int, default=5000, help="Web 服务器端口 (默认 5000)")
+    web_parser.add_argument("--host", "-H", default="127.0.0.1", help="绑定主机地址 (默认 127.0.0.1)")
+    web_parser.add_argument("--mock", action="store_true", help="默认开启演练模拟账库模式")
+    web_parser.add_argument("--debug", action="store_true", help="开启调试模式")
+
     args = parser.parse_args()
     try:
         if args.command == "run":
             task = asyncio.run(execute_task(args.task, args.model, args.mock, args.title,
                                            repo_root=args.repo_root, test_command=args.test_command))
             return 0 if task.state == "SUCCESS" else 2
-        if args.command == "status":
+        if args.command == "web":
+            from web.app import create_app
+            app = create_app(mock_default=args.mock)
+            console.print(Panel(
+                f"Web 控制台已启动: [bold green]http://{args.host}:{args.port}[/bold green]\n"
+                f"模式: {'独立演练模拟账库 (Mock)' if args.mock else '真实调用账库 (Live)'}",
+                title="AgentCooperation Web 控制台", border_style="cyan"
+            ))
+            app.run(host=args.host, port=args.port, debug=args.debug)
+            return 0
+        if args.command == "multica-run":
+            res = asyncio.run(execute_multica_issue(
+                args.issue_id, args.title, args.task, args.model, args.mock,
+                repo_root=args.repo_root, test_command=args.test_command,
+                persistence_file=args.board_file,
+            ))
+            return 0 if res.multica_status == "done" else 2
+        elif args.command == "multica-worker":
+            asyncio.run(execute_multica_worker(
+                args.model, args.mock,
+                repo_root=args.repo_root,
+                interval=args.interval,
+                max_cycles=1 if args.once else None,
+                persistence_file=args.board_file,
+            ))
+            return 0
+        elif args.command == "multica-board":
+            show_multica_board(args.board_file)
+            return 0
+        elif args.command == "status":
             show_status(args.mock)
         elif args.command == "tasks":
             list_tasks(args.mock)

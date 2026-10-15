@@ -33,8 +33,9 @@ def test_default_reviewer_uses_available_subscription_route():
 def test_default_antigravity_model_matches_selected_effort():
     from config.settings import AppSettings
     defaults = AppSettings(_env_file=None)
-    assert defaults.antigravity_review_model == "gemini-3.8-flash-low"
-    assert defaults.antigravity_review_effort == "low"
+    assert defaults.antigravity_review_model == "gemini-3.8-flash-high"
+    assert defaults.antigravity_review_effort == "high"
+    assert defaults.codex_expert_model == "gpt-6.1-sol"
 
 
 @pytest.mark.asyncio

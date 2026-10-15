@@ -105,3 +105,8 @@ class WorktreeManager:
         if force:
             cmd.append("--force")
         await self._git([*cmd, str(path)], self.repo_root)
+
+    async def is_clean(self, worktree_path: Path) -> bool:
+        path = await self._validate_worktree(worktree_path)
+        status = await self._git(["status", "--porcelain"], path)
+        return not bool(status.strip())

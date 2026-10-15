@@ -3,7 +3,8 @@ from storage.models import (
     ExecutionLog,
     PendingCodexAudit,
     CodexQuotaRecord,
-    MonthlySpending
+    MonthlySpending,
+    IdempotencyRecord,
 )
 from storage.db import (
     engine,
@@ -19,6 +20,7 @@ __all__ = [
     "PendingCodexAudit",
     "CodexQuotaRecord",
     "MonthlySpending",
+    "IdempotencyRecord",
     "engine",
     "init_db",
     "get_session",

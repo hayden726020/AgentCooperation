@@ -1,8 +1,17 @@
+import os
 from pathlib import Path
 from typing import Literal, Optional, List
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Ensure .env is loaded into process environment regardless of startup CWD
+_default_env = Path(os.getenv("AGENT_COOPERATION_ENV_FILE") or (PROJECT_ROOT / ".env"))
+if _default_env.is_file():
+    load_dotenv(dotenv_path=_default_env, override=False)
 
 
 class ModelPricing(BaseModel):
@@ -56,20 +65,25 @@ class ExecutionConfig(BaseModel):
     max_context_tokens: int = Field(default=200000, gt=0)
 
 
+class SecurityConfig(BaseModel):
+    allowed_repos: List[str] = Field(default_factory=lambda: ["."])
+
+
 class PolicyConfig(BaseModel):
     primary_agent: Literal["glm", "deepseek"] = "glm"
-    reviewer_agent: Literal["gemini_cli", "antigravity_cli", "codex_cli"] = "codex_cli"
+    reviewer_agent: Literal["gemini_cli", "antigravity_cli", "codex_cli"] = "antigravity_cli"
     expert_agent: str = "codex_cli"
     models: dict[str, ModelPricing] = Field(default_factory=dict)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     codex: CodexConfig = Field(default_factory=CodexConfig)
     repair: RepairConfig = Field(default_factory=RepairConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
 
 
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.getenv("AGENT_COOPERATION_ENV_FILE") or str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore"
     )
@@ -88,19 +102,28 @@ class AppSettings(BaseSettings):
     codex_cli_cmd: str = "codex"
     opencode_cli_cmd: str = "opencode"
     antigravity_cli_cmd: str = "agy"
-    antigravity_review_model: str = "gemini-3.8-flash-medium"
-    antigravity_review_effort: Literal["low", "medium", "high"] = "low"
+    codex_expert_model: str = "gpt-6.1-sol"
+    antigravity_review_model: str = "gemini-3.8-flash-high"
+    antigravity_review_effort: Literal["high"] = "high"
+    gemini_review_model: str = "gemini-3.8-flash-high"
+    gemini_review_effort: Literal["high"] = "high"
     gemini_cli_argv_prefix: List[str] = Field(default_factory=list)
     codex_cli_argv_prefix: List[str] = Field(default_factory=list)
     opencode_cli_argv_prefix: List[str] = Field(default_factory=list)
     antigravity_cli_argv_prefix: List[str] = Field(default_factory=list)
 
-    # SQLite Database
-    sqlite_db_path: str = "data/agent_orchestrator.db"
-    policy_yaml_path: str = "config/policy.yaml"
+    # SQLite Database & Policy
+    sqlite_db_path: str = Field(
+        default_factory=lambda: os.getenv("AGENT_COOPERATION_DB_PATH") or str(PROJECT_ROOT / "data" / "agent_orchestrator.db")
+    )
+    policy_yaml_path: str = Field(
+        default_factory=lambda: os.getenv("AGENT_COOPERATION_POLICY_PATH") or str(PROJECT_ROOT / "config" / "policy.yaml")
+    )
 
     def load_policy(self) -> PolicyConfig:
         policy_path = Path(self.policy_yaml_path)
+        if not policy_path.is_absolute():
+            policy_path = (PROJECT_ROOT / policy_path).resolve()
         if not policy_path.exists():
             return PolicyConfig()
 
@@ -108,23 +131,43 @@ class AppSettings(BaseSettings):
             raw = yaml.safe_load(f) or {}
 
         agents_data = raw.get("agents", {})
+        raw_models = raw.get("models", {})
         models_data = {
-            k: ModelPricing(**v) for k, v in raw.get("models", {}).items()
+            k: ModelPricing(**v) for k, v in raw_models.items()
         }
+        if "glm" not in models_data:
+            models_data["glm"] = ModelPricing(
+                model_id="glm-5.3-flashx",
+                base_url="https://open.bigmodel.cn/api/paas/v4",
+                input_price_per_m_usd=0.15,
+                output_price_per_m_usd=0.50,
+            )
+        if "deepseek" not in models_data:
+            models_data["deepseek"] = ModelPricing(
+                model_id="deepseek-flash",
+                base_url="https://api.deepseek.com/v1",
+                input_price_per_m_usd=0.15,
+                output_price_per_m_usd=0.60,
+                peak_input_price_per_m_usd=0.30,
+                peak_output_price_per_m_usd=1.20,
+            )
+
         budget_data = BudgetConfig(**raw.get("budget", {}))
         codex_data = CodexConfig(**raw.get("codex", {}))
         repair_data = RepairConfig(**raw.get("repair", {}))
         exec_data = ExecutionConfig(**raw.get("execution", {}))
+        sec_data = SecurityConfig(**raw.get("security", {}))
 
         return PolicyConfig(
             primary_agent=agents_data.get("primary", "glm"),
-            reviewer_agent=agents_data.get("reviewer", "codex_cli"),
+            reviewer_agent=agents_data.get("reviewer", "antigravity_cli"),
             expert_agent=agents_data.get("expert", "codex_cli"),
             models=models_data,
             budget=budget_data,
             codex=codex_data,
             repair=repair_data,
-            execution=exec_data
+            execution=exec_data,
+            security=sec_data,
         )
 
 

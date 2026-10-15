@@ -5,6 +5,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -48,6 +49,19 @@ class OrchestratorCore:
             return AntigravityReviewer(mock_mode=mock_mode)
         raise ValueError(f"Unsupported independent reviewer: {self.policy.reviewer_agent}")
 
+    def _defer_codex_review(self, task_id, fsm, checkpoint, diff, tests, worktree,
+                           requirement, reason):
+        self.codex_guard.handle_quota_exhausted(
+            task_id=task_id, commit_sha=checkpoint, severity="P1",
+            issue_description="Independent Codex review deferred: subscription quota exhausted",
+            git_diff_summary=diff, worktree_path=str(worktree), test_summary=tests,
+            issue_context=f"Original requirement:\n{requirement}", reason=reason,
+        )
+        self._log_step(task_id, "Codex-CLI Review", "REVIEWER", "Codex-CLI",
+                       status="DEFERRED", error=reason)
+        fsm.to_waiting_review()
+        return self._finish(task_id, fsm, "Tests passed; independent Codex review queued until quota recovers")
+
     def _log_step(self, task_id, step_name, role, model, result=None, *, status=None, error=None):
         result = result or AgentResult(success=not error, content="", error=error)
         with self._session() as session:
@@ -84,7 +98,7 @@ class OrchestratorCore:
 
     @staticmethod
     def _project_context(root: Path, limit=24000):
-        """Bound source context; do not follow links or read credential files."""
+        """Prioritize current briefs and source within a fixed character budget."""
         root = root.resolve(strict=True)
         def safe_path(path):
             try:
@@ -94,29 +108,48 @@ class OrchestratorCore:
                 return False
         excluded = {".git", ".worktrees", "references", "data", "node_modules", ".venv",
                     "venv", "__pycache__", ".pytest_cache", ".pytest_temp", "dist", "build"}
-        extensions = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".md", ".json", ".toml"}
+        extensions = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".md",
+                      ".json", ".toml", ".yaml", ".yml"}
+        priority = [root / name for name in ("AGENTS.md", "docs/CONTEXT.md", "README.md")]
+
+        def source_files(markdown):
+            for directory, dirs, files in os.walk(root, followlinks=False):
+                base = Path(directory)
+                dirs[:] = sorted(
+                    d for d in dirs
+                    if d not in excluded and not d.startswith(".")
+                    and safe_path(base / d)
+                    and not os.path.lexists(base / d / ".git")
+                    and (base / d).relative_to(root).as_posix() != "docs/archive"
+                )
+                for name in sorted(files):
+                    file = base / name
+                    if file not in priority and (file.suffix == ".md") == markdown:
+                        yield file
+
         parts = []
         remaining = limit
-        for directory, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if d not in excluded and not d.startswith(".")
-                             and safe_path(Path(directory) / d))
-            for name in sorted(files):
-                file = Path(directory) / name
-                if not safe_path(file) or file.suffix not in extensions or name.startswith("."):
+        for file in chain(priority, source_files(False), source_files(True)):
+            if remaining <= 0:
+                break
+            name = file.name
+            if (not safe_path(file) or name.startswith(".")
+                    or (file.suffix not in extensions and name != "requirements.txt")):
+                continue
+            if any(os.path.lexists(parent / ".git") for parent in file.parents
+                   if parent != root and parent.is_relative_to(root)):
+                continue
+            if any(word in name.lower() for word in ("secret", "credential", "token", "auth", "key")):
+                continue
+            try:
+                if file.stat().st_size > 128000:
                     continue
-                if any(word in name.lower() for word in ("secret", "credential", "token", "auth", "key")):
-                    continue
-                try:
-                    if file.stat().st_size > 128000:
-                        continue
-                    text = file.read_text(encoding="utf-8")[:min(8000, remaining)]
-                except (OSError, UnicodeError):
-                    continue
-                part = f"\n=== {file.relative_to(root).as_posix()} ===\n{text}\n"
-                parts.append(part[:remaining])
-                remaining -= len(parts[-1])
-                if remaining <= 0:
-                    return "".join(parts)
+                text = file.read_text(encoding="utf-8")[:min(8000, remaining)]
+            except (OSError, UnicodeError):
+                continue
+            part = f"\n=== {file.relative_to(root).as_posix()} ===\n{text}\n"
+            parts.append(part[:remaining])
+            remaining -= len(parts[-1])
         return "".join(parts)
 
     async def _call_primary(self, task_id, agent, step, prompt, worktree, mock_mode):
@@ -153,7 +186,7 @@ class OrchestratorCore:
         for path in (*worktree.glob("test_*.py"), *worktree.glob("*_test.py")):
             if path.is_file() and not path.is_symlink():
                 paths.add(path.name)
-        for name in generated_files:
+        for name in (generated_files or []):
             path = Path(name)
             path = path if path.is_absolute() else worktree / path
             try:
@@ -169,19 +202,22 @@ class OrchestratorCore:
 
     async def run_task(self, requirement: str, title: Optional[str] = None,
                        chosen_model: Optional[Literal["glm", "deepseek"]] = None,
-                       mock_mode: bool = False, custom_test_cmd: Optional[str] = None) -> Task:
+                       mock_mode: bool = False, custom_test_cmd: Optional[str] = None,
+                       task_id: Optional[str] = None) -> Task:
         if not requirement.strip():
             raise ValueError("Task requirement must not be empty")
         if not mock_mode:
             can_start, message = self.budget_guard.check_can_start_new_task()
             if not can_start:
                 raise BudgetLimitError(message)
-        task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        task_id = task_id or f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         model_name = chosen_model or self.policy.primary_agent
         with self._session() as session:
-            session.add(Task(task_id=task_id, title=title or requirement[:40], requirement=requirement,
-                             primary_model=model_name, branch_name=f"codex/task_{task_id}", state="INIT"))
-            session.commit()
+            existing = session.exec(select(Task).where(Task.task_id == task_id)).first()
+            if not existing:
+                session.add(Task(task_id=task_id, title=title or requirement[:40], requirement=requirement,
+                                 primary_model=model_name, branch_name=f"codex/task_{task_id}", state="INIT"))
+                session.commit()
         fsm = TaskLifecycleFSM(max_repair_attempts=self.policy.repair.max_normal_attempts)
         generated_files = set()
         last_review = None
@@ -237,13 +273,30 @@ class OrchestratorCore:
                     fsm.to_reviewing()
                     self._save_state(task_id, fsm)
                     diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
-                    review_result = await reviewer.execute("Review requirements, code and actual test evidence.", context={
-                        "worktree_path": worktree, "git_diff": diff, "test_summary": test_result.raw_output,
-                        "requirement": requirement,
-                        "expected_commit_sha": checkpoint,
-                    })
+                    uses_live_codex = not mock_mode and self.policy.reviewer_agent == "codex_cli"
+                    if uses_live_codex:
+                        self.codex_guard._sync_state_from_db()
+                        if self.codex_guard.state == "EXHAUSTED":
+                            return self._defer_codex_review(
+                                task_id, fsm, checkpoint, diff, test_result.raw_output, worktree,
+                                requirement, "Persisted Codex subscription quota exhausted",
+                            )
+                    try:
+                        review_result = await reviewer.execute("Review requirements, code and actual test evidence.", context={
+                            "worktree_path": worktree, "git_diff": diff, "test_summary": test_result.raw_output,
+                            "requirement": requirement,
+                            "expected_commit_sha": checkpoint,
+                        })
+                    except CodexQuotaExhaustedError as quota_error:
+                        if not uses_live_codex:
+                            raise
+                        return self._defer_codex_review(
+                            task_id, fsm, checkpoint, diff, test_result.raw_output, worktree,
+                            requirement, str(quota_error),
+                        )
                     reviewer_model = getattr(reviewer, "model_name", self.policy.reviewer_agent)
-                    self._log_step(task_id, f"{reviewer_model} Review", "REVIEWER", reviewer_model, review_result)
+                    actual_review_model = review_result.metadata.get("review_model") or reviewer_model
+                    self._log_step(task_id, f"{reviewer_model} Review", "REVIEWER", actual_review_model, review_result)
                     if not review_result.success:
                         raise RuntimeError(f"Independent review failed: {review_result.error}")
                     last_review = review_result.metadata.get("review")
@@ -344,6 +397,250 @@ class OrchestratorCore:
                 )
                 fsm.to_testing()
 
+        except BudgetLimitError as error:
+            fsm.to_budget_stopped()
+            self._log_step(task_id, "Budget Stop", "SYSTEM", "Orchestrator", error=str(error))
+            return self._finish(task_id, fsm, str(error))
+        except asyncio.CancelledError:
+            fsm.to_interrupted()
+            self._finish(task_id, fsm, "Execution interrupted; automatic delivery withheld")
+            raise
+        except Exception as error:
+            fsm.to_failed()
+            self._log_step(task_id, "Fatal Exception", "SYSTEM", "Orchestrator", error=str(error))
+            return self._finish(task_id, fsm, f"Execution failed: {error}")
+
+    async def resume_task_after_approval(
+        self,
+        task_id: str,
+        approved: bool,
+        notes: Optional[str] = None,
+        mock_mode: bool = False,
+        custom_test_cmd: Optional[str] = None,
+    ) -> Task:
+        """Resume execution of a task currently held in WAITING_APPROVAL.
+
+        Human approval authorizes subsequent processing; the task must still pass
+        necessary repair, testing, and independent review before reaching SUCCESS.
+        """
+        with self._session() as session:
+            task = session.exec(select(Task).where(Task.task_id == task_id)).first()
+            if not task:
+                raise ValueError(f"Task '{task_id}' not found.")
+            if task.state != "WAITING_APPROVAL":
+                raise ValueError(f"Task '{task_id}' is in state '{task.state}', expected 'WAITING_APPROVAL'.")
+
+        decision_note = notes or "No notes provided"
+        if not approved:
+            fsm = TaskLifecycleFSM(initial_state="WAITING_APPROVAL")
+            fsm.to_failed()
+            self._log_step(
+                task_id,
+                "Human Approval Decision",
+                "SYSTEM",
+                "HumanOperator",
+                AgentResult(False, f"Rejected by human operator: {decision_note}", error=f"Human rejection: {decision_note}"),
+            )
+            return self._finish(task_id, fsm, f"Rejected by human operator: {decision_note}")
+
+        fsm = TaskLifecycleFSM(
+            max_repair_attempts=self.policy.repair.max_normal_attempts,
+            initial_state="WAITING_APPROVAL",
+        )
+        fsm.repair_attempts = task.repair_attempts
+        self._log_step(
+            task_id,
+            "Human Approval Decision",
+            "SYSTEM",
+            "HumanOperator",
+            AgentResult(True, f"Approved by human operator: {decision_note}"),
+        )
+        fsm.to_repairing_from_approval()
+        self._save_state(task_id, fsm)
+
+        model_name = task.primary_model or self.policy.primary_agent
+        primary = SingleEngineSlotEnforcer(self.policy).get_primary_agent(model_name, mock_mode=mock_mode)
+        reviewer = self._get_reviewer(mock_mode=mock_mode)
+        expert = CodexExpert(mock_mode=mock_mode)
+        worktree_str = task.worktree_path
+        if not worktree_str or not Path(worktree_str).exists():
+            worktree = (await self.worktree_mgr.create_worktree(task_id)).resolve()
+            with self._session() as session:
+                task_db = session.exec(select(Task).where(Task.task_id == task_id)).first()
+                if task_db:
+                    task_db.worktree_path = str(worktree)
+                    session.add(task_db)
+                    session.commit()
+        else:
+            worktree = Path(worktree_str).resolve()
+        base_ref = await self.worktree_mgr.get_base_ref(worktree)
+        checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, "chore: checkpoint before approved repair")
+        requirement = task.requirement
+        generated_files = set(self._test_paths(worktree, []) or [])
+
+        # Execute repair with Primary Agent incorporating operator instructions
+        repair_prompt = (
+            f"Requirement:\n{requirement}\n\n"
+            f"Human Operator Approval:\n{decision_note}\n\n"
+            "Apply the authorized implementation repair and ensure all tests pass. Do not weaken tests."
+        )
+        repair_res = await self._call_primary(
+            task_id, primary, f"Approved Repair #{fsm.repair_attempts}", repair_prompt, worktree, mock_mode
+        )
+        generated_files.update(repair_res.metadata.get("files_written", []))
+        checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, f"fix: human approved repair #{fsm.repair_attempts}")
+        fsm.to_testing()
+
+        # Strict testing and review loop (FSM verified delivery)
+        last_review = None
+        fallback_used = False
+        try:
+            while True:
+                self._save_state(task_id, fsm)
+                runner = TestRunner(worktree, custom_test_cmd=custom_test_cmd,
+                                    test_paths=self._test_paths(worktree, generated_files) or None)
+                test_result = await runner.run(timeout=self.policy.execution.timeout_seconds)
+                current_diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
+                self.codex_guard.update_pending_evidence(
+                    task_id, checkpoint, current_diff, test_result.raw_output
+                )
+                fsm.tests_passed = test_result.passed
+                fsm.review_approved = False
+                self._log_step(task_id, f"Testing (attempt {fsm.repair_attempts})", "TEST_RUNNER", "LocalRunner",
+                               AgentResult(test_result.passed, test_result.raw_output,
+                                           error=None if test_result.passed else test_result.summary))
+                issue = test_result.raw_output
+                severity = "P1"
+
+                if test_result.passed:
+                    fsm.to_reviewing()
+                    self._save_state(task_id, fsm)
+                    diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
+                    uses_live_codex = not mock_mode and self.policy.reviewer_agent == "codex_cli"
+                    if uses_live_codex:
+                        self.codex_guard._sync_state_from_db()
+                        if self.codex_guard.state == "EXHAUSTED":
+                            return self._defer_codex_review(
+                                task_id, fsm, checkpoint, diff, test_result.raw_output, worktree,
+                                requirement, "Persisted Codex subscription quota exhausted",
+                            )
+                    try:
+                        review_result = await reviewer.execute("Review requirements, code and actual test evidence.", context={
+                            "worktree_path": worktree, "git_diff": diff, "test_summary": test_result.raw_output,
+                            "requirement": requirement,
+                            "expected_commit_sha": checkpoint,
+                        })
+                    except CodexQuotaExhaustedError as quota_error:
+                        if not uses_live_codex:
+                            raise
+                        return self._defer_codex_review(
+                            task_id, fsm, checkpoint, diff, test_result.raw_output, worktree,
+                            requirement, str(quota_error),
+                        )
+                    reviewer_model = getattr(reviewer, "model_name", self.policy.reviewer_agent)
+                    actual_review_model = review_result.metadata.get("review_model") or reviewer_model
+                    self._log_step(task_id, f"{reviewer_model} Review", "REVIEWER", actual_review_model, review_result)
+                    if not review_result.success:
+                        raise RuntimeError(f"Independent review failed: {review_result.error}")
+                    last_review = review_result.metadata.get("review")
+                    if (not isinstance(last_review, dict) or type(last_review.get("approved")) is not bool
+                            or last_review.get("severity") not in {"P0", "P1", "P2", "P3"}):
+                        raise RuntimeError("Independent review did not provide a valid verdict")
+                    severity = last_review["severity"]
+                    issue = review_result.content
+                    if last_review["approved"] and severity not in {"P0", "P1"}:
+                        self.codex_guard.update_pending_evidence(
+                            task_id, checkpoint, diff, test_result.raw_output, json.dumps(last_review)
+                        )
+                        fsm.review_approved = True
+                        fsm.to_success()
+                        suffix = " (simulation; not a live delivery)" if mock_mode else ""
+                        return self._finish(task_id, fsm, "Tests and independent review passed after human approval" + suffix)
+                    if severity == "P0":
+                        fsm.to_waiting_approval()
+                        return self._finish(task_id, fsm, "P0 risk requires authorized human approval; no automatic expert patch applied")
+                    elif fsm.can_repair() and severity not in {"P0", "P1"} and not fallback_used:
+                        fsm.to_repairing_from_review()
+                    else:
+                        fsm.to_escalating_from_review()
+                elif fsm.can_repair() and not fallback_used:
+                    fsm.to_repairing()
+                else:
+                    fsm.to_escalating_from_test()
+
+                self._save_state(task_id, fsm)
+                if fsm.state == "REPAIRING":
+                    repair = await self._call_primary(task_id, primary, f"Repair #{fsm.repair_attempts}",
+                        f"Requirement:\n{requirement}\n"
+                        f"Test/review rejection evidence:\n{issue}\nRepair the implementation; preserve acceptance tests.",
+                        worktree, mock_mode)
+                    generated_files.update(repair.metadata.get("files_written", []))
+                    checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, f"fix: repair #{fsm.repair_attempts}")
+                    fsm.to_testing()
+                    continue
+
+                # Escalation
+                diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
+                advice = None
+                expert_available = self.codex_guard.is_available()
+                quota_exhausted = self.policy.codex.enabled and self.codex_guard.state == "EXHAUSTED"
+                with self._session() as session:
+                    task_rec = session.exec(select(Task).where(Task.task_id == task_id)).one()
+                    expert_allowed = expert_available and task_rec.codex_calls < self.policy.codex.max_calls_per_task
+                    if expert_allowed and not quota_exhausted:
+                        task_rec.codex_calls += 1
+                        session.add(task_rec)
+                        session.commit()
+                if expert_allowed and not quota_exhausted:
+                    try:
+                        advice = await expert.execute("Diagnose the issue and provide a verifiable repair plan.", context={
+                            "worktree_path": worktree,
+                            "issue_context": f"Requirement: {requirement}\nSeverity: {severity}\n"
+                                             f"Evidence: {issue}\nTests: {test_result.raw_output}\nDiff:\n{diff}",
+                        })
+                        self._log_step(task_id, "Codex Escalation", "EXPERT", "Codex-CLI", advice)
+                    except CodexQuotaExhaustedError:
+                        quota_exhausted = True
+
+                if quota_exhausted:
+                    self.codex_guard.handle_quota_exhausted(
+                        task_id=task_id, commit_sha=checkpoint, severity=severity,
+                        issue_description=issue, git_diff_summary=diff,
+                        gemini_review_json=json.dumps(last_review) if last_review else None,
+                        worktree_path=str(worktree), test_summary=test_result.raw_output,
+                        issue_context=f"Requirement:\n{requirement}",
+                        reason="Confirmed Codex usage limit or persisted exhausted state",
+                    )
+
+                if severity == "P0":
+                    fsm.to_waiting_approval()
+                    return self._finish(task_id, fsm, "P0 risk requires authorized human approval; no automatic expert patch applied")
+                if not expert_allowed and not quota_exhausted:
+                    fsm.to_waiting_review()
+                    return self._finish(task_id, fsm, "Expert review disabled or task call limit reached")
+                if advice is not None and not advice.success:
+                    raise RuntimeError(f"Expert review failed: {advice.error}")
+                if quota_exhausted:
+                    if fallback_used:
+                        raise RuntimeError("Fallback did not pass tests and independent review; audit remains queued")
+                    fallback_used = True
+                    fsm.to_codex_backlogged()
+                    fsm.to_repairing_from_backlog()
+                    patch_prompt = f"Codex is unavailable. Independently diagnose and repair this P1 issue:\n{issue}\n"
+                else:
+                    fsm.to_repairing_from_codex()
+                    patch_prompt = f"Expert advice:\n{advice.content}\nApply the advised implementation repair.\n"
+                self._save_state(task_id, fsm)
+                patch = await self._call_primary(task_id, primary, "Expert/Fallback Repair",
+                    f"Requirement:\n{requirement}\n{patch_prompt}\nTests:\n{test_result.raw_output}",
+                    worktree, mock_mode)
+                generated_files.update(patch.metadata.get("files_written", []))
+                checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, "fix: expert or fallback repair")
+                self.codex_guard.update_pending_evidence(
+                    task_id, checkpoint, await self.worktree_mgr.get_diff(worktree, base_ref=base_ref),
+                    "Repair committed; validation pending"
+                )
+                fsm.to_testing()
         except BudgetLimitError as error:
             fsm.to_budget_stopped()
             self._log_step(task_id, "Budget Stop", "SYSTEM", "Orchestrator", error=str(error))

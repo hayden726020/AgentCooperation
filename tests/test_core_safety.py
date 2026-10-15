@@ -218,6 +218,58 @@ def test_existing_suffix_tests_are_included(harness):
     assert "existing_test.py" in harness.core._test_paths(root, [])
 
 
+def test_source_context_prioritizes_current_brief_within_budget(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("current instructions", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "CONTEXT.md").write_text("current project brief", encoding="utf-8")
+    (tmp_path / "A_OLD_REPORT.md").write_text("obsolete report " * 1000, encoding="utf-8")
+    context = core_module.OrchestratorCore._project_context(tmp_path, limit=150)
+    assert "current instructions" in context
+    assert "current project brief" in context
+    assert len(context) <= 150
+
+
+def test_source_context_excludes_nested_repos_and_historical_docs(tmp_path):
+    for name, git_file in (("vendor_bot", False), ("task_copy", True)):
+        repo = tmp_path / name
+        repo.mkdir()
+        if git_file:
+            (repo / ".git").write_text("gitdir: elsewhere", encoding="utf-8")
+        else:
+            (repo / ".git").mkdir()
+        (repo / "main.py").write_text("vendor_noise = True", encoding="utf-8")
+    (tmp_path / "docs" / "archive").mkdir(parents=True)
+    (tmp_path / "docs" / "archive" / "old.md").write_text("historical_noise", encoding="utf-8")
+    (tmp_path / "main.py").write_text("project_source = True", encoding="utf-8")
+    context = core_module.OrchestratorCore._project_context(tmp_path)
+    assert "project_source" in context
+    assert "vendor_noise" not in context
+    assert "historical_noise" not in context
+
+
+def test_source_context_reads_source_before_supplementary_reports(tmp_path):
+    (tmp_path / "OLD_REPORT.md").write_text("old notes " * 1000, encoding="utf-8")
+    (tmp_path / "main.py").write_text("important_source = True", encoding="utf-8")
+    context = core_module.OrchestratorCore._project_context(tmp_path, limit=100)
+    assert "important_source" in context
+    assert len(context) <= 100
+
+
+@pytest.mark.parametrize("git_file", [False, True])
+def test_priority_context_cannot_bypass_nested_repo_boundary(tmp_path, git_file):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    if git_file:
+        (docs / ".git").write_text("gitdir: elsewhere", encoding="utf-8")
+    else:
+        (docs / ".git").mkdir()
+    (docs / "CONTEXT.md").write_text("nested_private_brief", encoding="utf-8")
+    (tmp_path / "main.py").write_text("project_source = True", encoding="utf-8")
+    context = core_module.OrchestratorCore._project_context(tmp_path)
+    assert "nested_private_brief" not in context
+    assert "project_source" in context
+
+
 def test_source_context_rejects_directory_links(tmp_path):
     target = tmp_path / "task"
     outside = tmp_path / "outside"

@@ -195,6 +195,8 @@ class AntigravityReviewer(BaseAgent):
                 profile.write_text(REVIEW_AGENT_PROFILE, encoding="utf-8")
                 schema = cwd / "review.schema.json"
                 schema.write_text(json.dumps(REVIEW_JSON_SCHEMA), encoding="utf-8")
+                if settings.antigravity_review_effort != "high":
+                    raise ValueError(f"Antigravity reasoning effort must be 'high', got '{settings.antigravity_review_effort}'")
                 command = build_cli_argv(self.cli_cmd, self.cli_argv_prefix) + [
                     "--input-format", "stream-json", "--output-format", "stream-json",
                     "--agent", REVIEW_AGENT_NAME, "--model", settings.antigravity_review_model,

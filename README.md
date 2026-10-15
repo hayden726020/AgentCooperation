@@ -1,115 +1,71 @@
 # AgentCooperation
 
-Python + SQLite 编排器：每个任务选择 **GLM Flash 或 DeepSeek Flash 其中一个**，由同一引擎负责规划、开发和修复；Gemini CLI 独立验收，Codex CLI 处理重要问题及延期补审。
+Python + SQLite 研发任务编排器，提供 CLI、Web 和 Hermes / Multica 适配入口。
 
-单任务 Flash 二选一是用户指定的架构。所有阶段复用该实例，禁止中途串联另一 Flash 引擎。
+自动流水线每个任务选定 GLM 或 DeepSeek 一个 Flash 引擎，复用它完成规划、开发和常规修复；默认 Antigravity CLI 独立复核，Codex CLI 处理专家修复和延期补审。测试与复核通过才能交付。配置以 `config/policy.yaml` 为准。
 
-## 当前交付规则
+## 快速使用
 
-- 每次模型调用检查成功状态、实际文件输出与预算；缺密钥立即报错，模拟必须显式开启。
-- 测试失败最多进行三轮常规修复。审查拒绝同样需要修复和重新测试。
-- 专家补丁和额度耗尽后的替代修复都返回测试、独立复核；测试及审查通过才能进入 `SUCCESS`。
-- P0 进入 `WAITING_APPROVAL`，保留严重级别和专家意见，停止自动应用专家补丁。
-- Codex 禁用、保留状态、恢复中、调用次数耗尽与确认用量耗尽分别处理。一般 429/网络故障不标为周额度耗尽。
-- Codex 耗尽时保存完整问题、最终提交、diff、测试和 Gemini 结果；通过验证的 P1 成果可带补审标记完成。
-- 补审仅领取已完成或暂停任务。真实审查在调用前后验证完整提交 SHA 及干净工作区；失败保留记录，发现问题标为 `NEEDS_REPAIR`，明确批准后才关闭。
+需要 Python 3.11+、Git。真实模型和复核需有效凭据及已配置的 CLI；当前使用边界见 [项目上下文](docs/CONTEXT.md)。
 
-## 安装与配置
-
-需要 Python 3.11+、Git；真实审查需要已安装并登录的 Gemini CLI 和 Codex CLI。
-
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-在项目根目录的 `.env` 中配置选定引擎的密钥：
+参考 `.env.example` 在本地 `.env` 配置选定引擎的密钥。目标仓库应已有初始提交和 Git 提交身份。
 
-```ini
-GLM_API_KEY="your-key"
-DEEPSEEK_API_KEY="your-key"
-GEMINI_CLI_CMD="gemini"
-CODEX_CLI_CMD="codex"
-```
+```powershell
+# 显式模拟演练：不调用真实模型
+python -m orchestrator.cli run --repo-root /path/to/target-repo --task "实现缓存并测试" --mock
 
-也支持 `FLASH_API_KEY` / `FLASH_BASE_URL` 通用覆盖。密钥文件不会由模型生成流程修改。
+# 真实研发：按配置使用模型、预算和独立复核
+python -m orchestrator.cli run --repo-root /path/to/target-repo --task "实现缓存并测试" --model glm
 
-模型 ID、端点、费率、输出上限和预算位于 `config/policy.yaml`。发布环境必须验证账号可用模型与实际费率。当前价格是可配置的估算参数；DeepSeek 按高峰上界保守记账，缓存折扣没有抵扣预留。
-
-目标 Git 项目必须已经有初始提交，并已配置本地提交身份。程序不会自动暂存并初始化用户主仓库。
-
-## 使用
-
-在编排器目录运行，指定要开发的目标项目：
-
-```bash
-python -m orchestrator.cli run --repo-root /path/to/target-repo --task "实现缓存模块并编写行为测试" --model glm
-python -m orchestrator.cli run --repo-root /path/to/target-repo --task "实现二叉搜索树并测试" --model deepseek
-```
-
-不指定 `--model` 时使用策略中的 `agents.primary`。
-
-```bash
-python -m orchestrator.cli run --repo-root /path/to/target-repo --task "演练调度流程" --mock
 python -m orchestrator.cli status
 python -m orchestrator.cli tasks
-python -m orchestrator.cli status --mock
-python -m orchestrator.cli tasks --mock
+python -m orchestrator.cli web --port 5000 --mock
 ```
 
-模拟运行生成固定演练代码，只验证调度链路。模拟账库为原数据库名加 `.mock`，例如 `data/agent_orchestrator.mock.db`；模拟不能恢复真实额度或关闭真实审单。历史旧版本账本可能含有模拟费用，升级不会删除历史记录。
+特殊测试入口可加 `--test-command "npm test"`。目标测试在本机执行，工作树负责文件版本隔离。模拟与正式账库分开；任务失败或等待验收时 CLI 返回非零状态。
 
-任务失败、预算停止、等待批准或等待审查时，命令返回非零退出码。
+已有 Antigravity 登录时，可在 PowerShell 7.3+ 中直接打开 Gemini High 原生研发会话，无需 Gemini API 密钥：
 
-默认测试纳入目标已有 `tests/`、根目录 `test_*.py` / `*_test.py` 及新生成的测试。支持 pytest、unittest、Jest/Vitest、Mocha、Node TAP 统计。零测试、全跳过、全预期失败、无法确认测试执行的输出不会通过验收。目标有特殊测试入口时可以指定：
-
-```bash
-python -m orchestrator.cli run --repo-root /path/to/target-repo --task "修复边界错误" --test-command "npm test"
+```powershell
+./scripts/hermes_bots.ps1 direct coop-dev
+# 在已有任务工作目录中，携带自己的 UTF-8 任务文件：
+./scripts/hermes_bots.ps1 direct coop-dev -Workspace 'E:\目标项目' -TaskFile 'E:\任务.md'
 ```
 
-## 预算
+这是用户直接操作的原生 CLI 会话；退出后把修改 diff 和测试证据交给独立复核。它不经过 Hermes 模型 Provider，也不更改自动流水线。详见 [Gemini 原生研发入口](docs/GEMINI_NATIVE_DEV.md)。
 
-默认月度 ¥200、¥160 告警、¥190 暂停新任务、单任务 ¥10。
+本机 `coop-dev` 现已启用 Hermes 内部 Gemini 订阅 CLI **实验对话桥接**，通过真实 Agent 调用收到短回复，未使用 Gemini API 密钥：
 
-每次 API 调用根据输入字节上界、输出 Token 限制和保守费率，先在 SQLite 事务中预留；任务与月预算均计入并发预留。调用后幂等结算，专家补丁也记账。未知用量或中断按预留额保守处理。模拟费用只记模拟任务，不进入真实月支出。
-
-本地估算无法替代服务商账单和账户消费上限。¥160 当前提供告警；输出上限可通过策略调整。
-
-## Codex 补审恢复
-
-```bash
-python -m orchestrator.cli codex-backlog
-python -m orchestrator.cli codex-backlog --mock
+```powershell
+./scripts/hermes_bots.ps1 chat coop-dev
 ```
 
-人工根据官方用量信息设置本地状态和恢复时间：
+当前仅支持文本对话；Hermes 文件、终端工具和自动研发闭环尚未接通。详情及验证边界见 [Hermes Gemini 连接记录](docs/HERMES_GEMINI_CONNECTION_2026-10-14.md)。
 
-```bash
-python -m orchestrator.cli codex-quota --state EXHAUSTED --reset-at "2026-10-20T12:00:00+08:00"
-python -m orchestrator.cli codex-watch --interval 300
-```
+## 文档与目录
 
-没有时区的时间按北京时间解释。监控进程保持运行时，在记录的恢复时间后轻量探测，成功才处理队列；未设置恢复时间时等待人工设置或手动补审。CLI 监控不是已安装的 systemd 服务。
+| 入口 | 用途 |
+| --- | --- |
+| [当前上下文](docs/CONTEXT.md) | 角色配置、源码地图、待办和验收边界 |
+| [Hermes Bot 使用](docs/HERMES_BOTS.md) | 手动 Profiles 和运维说明；与自动流水线区分 |
+| [历史文档](docs/archive/README.md) | 历史验收、选型、修复记录和整理前完整 README |
+| [参考项目](references/README.md) | 已登记的 Git 子模块 |
+| `agents/`、`orchestrator/`、`execution/` | 模型适配、调度、工作树与测试 |
+| `config/`、`storage/` | 策略与账库 |
+| `integrations/`、`web/`、`scripts/` | Hermes / Multica、控制台和工具 |
 
-`NEEDS_REPAIR` 保留人工可见反馈和任务标记。后续修复提交重新更新证据后可以再次排队；当前不自动新建另一编程任务。
+`hermes-agent/`、`DeepSeekBot/` 是独立本地仓库，由各自 Git 管理。`.runtime/` 保存本地 CLI 依赖，`.integration/` 保存联调工作区，`data/` 保存实际账库，`.worktrees/` 保存任务工作树；这些目录不属于可随意删除的缓存。
 
-## 执行边界
+## 验证与当前边界
 
-各任务使用验证过的 Git worktree、`codex/task_<任务ID>` 分支和固定基础提交；创建或检查点失败立即停止。生成文件及上下文读取拒绝越界、链接及敏感目录。
-
-子进程过滤继承环境中的 API 凭据，超时及取消会回收进程。Git worktree 隔离的是文件版本，目标测试仍在本机执行。无人值守处理不受信任项目前，需要部署操作系统或容器权限、网络和凭据隔离；仓库尚未提供 Docker/systemd 部署。
-
-当前入口为 CLI，OpenCode 为独立适配器，Web/Telegram 控制台和任意任务中断后的自动续跑尚未提供。
-
-## 验证
-
-```bash
+```powershell
 python -m pytest tests/ -q -p no:cacheprovider
 ```
 
-测试包含故障回归、内存/独立数据库、真实临时 Git 仓库和真实进程清理；模型 API 和模型 CLI 用模拟返回验证，测试不产生模型费用。实际符号链接测试在 Windows 缺少权限时跳过，目录联接保护仍有真实 Windows 回归。
+Codex 恢复 UI 回归已归入 `tests/`，会随上述命令执行。测试使用隔离账库及模型模拟；不代表真实服务联调通过。
 
-当前开发环境为 Windows / Python 3.14。Python 3.11 语法已检查；较旧版本实际运行和真实服务联调仍待验证。
-
-## 开源参考
-
-`references/` 记录 transitions、awslabs/cli-agent-orchestrator 和 multi-agent-code-review。运行时实际使用 `transitions` 依赖；另两个项目是代码参考。需要拉取参考代码时使用 Git 子模块初始化。
+历史 Hermes 正式使用验收存在数据库升级、审批模式和调用边界等缺口，见 [当前上下文](docs/CONTEXT.md)。本次整理未关闭这些缺口。未提交的变更不会自动进入从 HEAD 创建的任务工作树。

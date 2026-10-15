@@ -226,7 +226,7 @@ async def test_antigravity_reviewer_fails_on_conflicting_or_trailing_error(monke
 
     async def fake_command(cmd, cwd=None, env=None, timeout=None, input_text=None):
         stream = (
-            json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-low", "cwd": str(cwd)}}) + "\n"
+            json.dumps({"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-high", "cwd": str(cwd)}}) + "\n"
             + json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": payload}}) + "\n"
         )
         return SubprocResult(["agy"], 0, stream, "", 0)
@@ -298,7 +298,7 @@ def test_fenced_json_with_code_blocks_in_suggestions_accepted():
 def test_antigravity_event_stream_duplicate_status_key_rejected():
     from agents.antigravity_reviewer import parse_antigravity_review
     stream = (
-        '{"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-low"}}\n'
+        '{"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-high"}}\n'
         '{"event": "result", "result": {"status": "ERROR", "status": "SUCCESS", "structured_output": {"approved": true, "severity": "P3", "summary": "ok", "critical_issues": [], "suggestions": []}}}\n'
     )
     with pytest.raises(ValueError, match="(?i)duplicate"):
@@ -308,7 +308,7 @@ def test_antigravity_event_stream_duplicate_status_key_rejected():
 def test_antigravity_event_stream_duplicate_approved_key_in_structured_output_rejected():
     from agents.antigravity_reviewer import parse_antigravity_review
     stream = (
-        '{"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-low"}}\n'
+        '{"event": "init", "init": {"agent": "orchestrator-readonly-reviewer", "tools": [], "model": "gemini-3.8-flash-high"}}\n'
         '{"event": "result", "result": {"status": "SUCCESS", "structured_output": {"approved": false, "approved": true, "severity": "P3", "summary": "ok", "critical_issues": [], "suggestions": []}}}\n'
     )
     with pytest.raises(ValueError, match="(?i)duplicate"):

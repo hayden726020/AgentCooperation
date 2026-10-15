@@ -14,6 +14,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal, TypedDict
 
 from sqlmodel import select
 
@@ -58,21 +59,29 @@ def test_limit_type(limit):
 
 REQUIREMENT = """Implement slug.py exposing slugify(value: str, max_length: int | None = None) -> str.
 Reject non-string value with TypeError. Normalize NFKD, casefold (ß -> ss), remove combining
-marks, keep only ASCII a-z/0-9. Replace runs of other characters with one hyphen and strip
+marks entirely. Keep ASCII a-z/0-9 and replace runs of every remaining other character
+(including non-ASCII characters and emoji) with one hyphen and strip
 edge hyphens. Optional max_length must be a positive int (bool is invalid): wrong type raises
 TypeError, nonpositive raises ValueError. Truncate to max_length then strip trailing hyphens.
 Do not modify tests/test_acceptance.py or .gitignore; those are fixed external acceptance
-tests. Add your own regression tests if useful. Plan only TASK.md and SPEC.json in planning;
-then implement runnable code in development. Keep documentation brief.
+tests. Add your own regression tests if useful. Emit each relative file exactly once per
+response, with its final complete contents. Keep documentation brief.
 """
 
 
-def git(root, *args):
+class AcceptanceVerification(TypedDict):
+    passed: bool
+    exit_code: int
+    output: str
+    tests_unchanged: bool
+
+
+def git(root: Path, *args: str) -> str:
     result = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=True, timeout=30)
     return result.stdout.strip()
 
 
-async def verify_acceptance(source, directory):
+async def verify_acceptance(source: Path, directory: Path) -> AcceptanceVerification:
     """Load only the implementation and trusted tests in a fresh verifier."""
     source_file = source / "slug.py"
     if source_file.is_symlink() or source_file.resolve(strict=True).parent != source.resolve(strict=True):
@@ -81,9 +90,11 @@ async def verify_acceptance(source, directory):
     (directory / "slug.py").write_bytes(source_file.read_bytes())
     acceptance = directory / "test_acceptance.py"
     acceptance.write_text(ACCEPTANCE, encoding="utf-8")
+    config = directory / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
     original = acceptance.read_bytes()
     result = await run_async_command(
-        [sys.executable, "-I", "-m", "pytest", "test_acceptance.py", "-q", "-p", "no:cacheprovider",
+        [sys.executable, "-I", "-m", "pytest", "-c", str(config), "test_acceptance.py", "-q", "-p", "no:cacheprovider",
          f"--rootdir={directory}", f"--confcutdir={directory}"],
         cwd=directory, env={"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}, timeout=60.0,
     )
@@ -96,7 +107,8 @@ async def verify_acceptance(source, directory):
             "exit_code": result.exit_code, "output": output, "tests_unchanged": unchanged}
 
 
-async def run(model, reviewer):
+async def run(model: Literal["deepseek", "glm"],
+              reviewer: Literal["antigravity_cli", "codex_cli"]) -> bool:
     project = Path(__file__).resolve().parents[1]
     root = project / ".integration" / f"live-{model}-{uuid.uuid4().hex[:8]}"
     (root / "tests").mkdir(parents=True)
@@ -107,6 +119,10 @@ async def run(model, reviewer):
                  ("config", "user.email", "probe@example.invalid"), ("add", "."),
                  ("commit", "-m", "test: fixed acceptance fixture before real model generation")]:
         git(root, *args)
+    fixture_paths = git(root, "ls-files").splitlines()
+    if fixture_paths != [".gitignore", "slug.py", "tests/test_acceptance.py"]:
+        raise RuntimeError("Synthetic fixture contains unexpected source files")
+    fixture_base = git(root, "rev-parse", "HEAD")
     baseline = await run_async_command(
         [sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider",
          f"--rootdir={root}", f"--confcutdir={root}"], cwd=root,
@@ -133,6 +149,7 @@ async def run(model, reviewer):
             "state": task.state, "result_summary": task.result_summary,
             "verified_success": verified_success,
             "branch": task.branch_name, "worktree": task.worktree_path,
+            "fixture_initial_paths": fixture_paths, "fixture_base_commit": fixture_base,
             "commit": git(worktree, "rev-parse", "HEAD") if worktree else None,
             "acceptance_unchanged": unchanged,
             "final_acceptance_exit_code": final_check["exit_code"] if final_check else None,
@@ -147,7 +164,7 @@ async def run(model, reviewer):
                        "output": log.output_snippet, "error": log.error_snippet} for log in logs],
         }
         (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+        print(json.dumps(report, ensure_ascii=True, indent=2), flush=True)
         return verified_success
 
 

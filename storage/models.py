@@ -25,6 +25,10 @@ class Task(SQLModel, table=True):
     codex_calls: int = 0
     has_pending_codex_audit: bool = False
     result_summary: Optional[str] = None
+    commit_sha: Optional[str] = None
+    mock_mode: bool = False
+    reviewer_model: Optional[str] = None
+    test_passed: Optional[bool] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     completed_at: Optional[datetime] = None
@@ -114,3 +118,20 @@ class PendingAuditContext(SQLModel, table=True):
     issue_context: str = ""
     test_summary: str = ""
     claimed_at: Optional[datetime] = None
+
+
+class IdempotencyRecord(SQLModel, table=True):
+    """Persistent request deduplication record to avoid duplicate tasks or budget reservations."""
+    __tablename__ = "idempotency_records"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    idempotency_key: str = Field(index=True, unique=True)
+    task_id: Optional[str] = Field(default=None, index=True)
+    repo_root: str = ""
+    requirement_hash: str = ""
+    chosen_model: str = "glm"
+    mock_mode: bool = Field(default=False)
+    status: str = "PENDING"  # "PENDING", "IN_PROGRESS", "COMPLETED", "FAILED", "REJECTED", "INTERRUPTED"
+    response_payload_json: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)

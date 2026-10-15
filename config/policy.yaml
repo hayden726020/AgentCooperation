@@ -1,11 +1,11 @@
 agents:
   primary: "glm"          # 默认主力："glm" 或 "deepseek"（互斥二选一）
-  reviewer: "codex_cli"  # Google 当前地区不可用；也可显式选择 antigravity_cli 或 gemini_cli
+  reviewer: "antigravity_cli"  # Google 订阅独立复核；也可显式选择 codex_cli 或 gemini_cli
   expert: "codex_cli"     # 架构/难题专家（本地订阅 CLI）
 
 models:
   glm:
-    model_id: "glm-5.3-flash"
+    model_id: "glm-5.3-flashx"
     base_url: "https://open.bigmodel.cn/api/paas/v4"
     input_price_per_m_usd: 0.15
     output_price_per_m_usd: 0.50
@@ -54,3 +54,7 @@ execution:
   git_worktree_base: ".worktrees"
   max_output_tokens: 8192
   max_context_tokens: 200000
+
+security:
+  allowed_repos:
+    - "."

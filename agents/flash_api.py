@@ -216,8 +216,17 @@ class FlashApiAgent(BaseAgent):
             else:
                 cost = float(reservation)
                 metadata["usage_missing"] = True
+                # DeepSeek defaults to high-effort thinking, which can exhaust a
+                # bounded output before delivering code. GLM-5.3 cannot disable
+                # thinking, so retain its supported mode at the lowest effort.
+                provider_options: dict[str, Any] = {}
+                if self.model_key == "deepseek":
+                    provider_options["thinking"] = {"type": "disabled"}
+                elif self.model_key == "glm":
+                    provider_options.update(thinking={"type": "enabled"})
                 response = await self.client.chat.completions.create(
-                    model=self.pricing.model_id, messages=messages, temperature=0.2, max_tokens=output_limit
+                    model=self.pricing.model_id, messages=messages, temperature=0.2, max_tokens=output_limit,
+                    extra_body=provider_options,
                 )
                 usage = response.usage
                 if usage is None or type(usage.prompt_tokens) is not int or type(usage.completion_tokens) is not int or usage.prompt_tokens < 0 or usage.completion_tokens < 0:

@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgentCooperation - 多智能体协同编排与审计控制台</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Lucide Icons CDN -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Custom CSS -->
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            slate: {
+              850: '#151f32',
+              900: '#0f172a',
+              950: '#070b14',
+            }
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased selection:bg-sky-500 selection:text-white">
+
+  <!-- Header Bar -->
+  <header class="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      
+      <!-- Brand & Title -->
+      <div class="flex items-center space-x-3">
+        <div class="h-9 w-9 rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-500/20">
+          <i data-lucide="cpu" class="w-5 h-5 text-white"></i>
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <h1 class="text-base font-bold tracking-tight text-white">AgentCooperation</h1>
+            <span class="text-2xs font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">v1.0</span>
+          </div>
+          <p class="text-2xs text-slate-400 hidden sm:block">Flash 主力研发 · Gemini 独立复核 · Codex 疑难补审</p>
+        </div>
+      </div>
+
+      <!-- Quick Metrics & Mode Toggle -->
+      <div class="flex items-center space-x-3 sm:space-x-4">
+        <!-- Live/Mock Mode Switch -->
+        <div class="flex items-center space-x-2 bg-slate-850 px-3 py-1.5 rounded-xl border border-slate-700/60">
+          <span id="envModeBadge" class="px-2 py-0.5 text-xs font-semibold rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+            🟢 真实调用 (Live)
+          </span>
+          <label class="relative inline-flex items-center cursor-pointer select-none">
+            <input type="checkbox" id="mockModeToggle" class="sr-only peer">
+            <div class="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-amber-600"></div>
+          </label>
+        </div>
+
+        <!-- Monthly Spend Pill -->
+        <div class="hidden md:flex items-center space-x-2 bg-slate-850 px-3 py-1.5 rounded-xl border border-slate-800 text-xs font-mono">
+          <span class="text-slate-400">本月支出:</span>
+          <span id="headerSpend" class="text-amber-400 font-bold">¥0.0000 / ¥200.00</span>
+        </div>
+
+        <!-- Codex Quota Pill -->
+        <div class="hidden lg:flex items-center">
+          <span id="headerQuotaBadge" class="px-2 py-1 text-xs rounded bg-slate-800 text-slate-400 font-mono">
+            Codex: 检查中...
+          </span>
+        </div>
+
+        <!-- Actions -->
+        <button onclick="App.openNewTaskModal()" class="inline-flex items-center space-x-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-xl bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white shadow-lg shadow-sky-500/25 transition">
+          <i data-lucide="plus-circle" class="w-3.5 h-3.5"></i>
+          <span>新建任务</span>
+        </button>
+      </div>
+
+    </div>
+  </header>
+
+  <!-- Navigation Tabs Bar -->
+  <div class="bg-slate-900 border-b border-slate-800">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between">
+      <nav class="flex space-x-1 py-2 overflow-x-auto">
+        <button data-tab="dashboard" class="tab-btn px-4 py-2 text-xs font-medium rounded-lg transition flex items-center space-x-2 bg-slate-800 text-sky-400 border border-sky-500/40">
+          <i data-lucide="layout-dashboard" class="w-4 h-4"></i>
+          <span>仪表盘概览</span>
+        </button>
+        <button data-tab="tasks" class="tab-btn px-4 py-2 text-xs font-medium rounded-lg transition flex items-center space-x-2 text-slate-400 hover:text-slate-200 border border-transparent">
+          <i data-lucide="list-todo" class="w-4 h-4"></i>
+          <span>任务编排与历史</span>
+        </button>
+        <button data-tab="multica" class="tab-btn px-4 py-2 text-xs font-medium rounded-lg transition flex items-center space-x-2 text-slate-400 hover:text-slate-200 border border-transparent">
+          <i data-lucide="trello" class="w-4 h-4"></i>
+          <span>Multica 团队看板</span>
+        </button>
+        <button data-tab="codex" class="tab-btn px-4 py-2 text-xs font-medium rounded-lg transition flex items-center space-x-2 text-slate-400 hover:text-slate-200 border border-transparent">
+          <i data-lucide="shield-check" class="w-4 h-4"></i>
+          <span>Codex 补审与额度</span>
+        </button>
+        <button data-tab="budget" class="tab-btn px-4 py-2 text-xs font-medium rounded-lg transition flex items-center space-x-2 text-slate-400 hover:text-slate-200 border border-transparent">
+          <i data-lucide="receipt" class="w-4 h-4"></i>
+          <span>预算守护与策略</span>
+        </button>
+      </nav>
+
+      <!-- Auto-refresh switch -->
+      <div class="hidden sm:flex items-center space-x-2 text-xs text-slate-400">
+        <label class="flex items-center space-x-1.5 cursor-pointer">
+          <input type="checkbox" id="autoRefreshToggle" checked class="rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0">
+          <span>5s 自动刷新</span>
+        </label>
+        <button onclick="App.refreshCurrentTab()" title="立即手动刷新" class="p-1 rounded hover:bg-slate-800 text-slate-400 hover:text-slate-200">
+          <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Content Container -->
+  <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+
+    <!-- TAB 1: 仪表盘概览 -->
+    <div id="tab-dashboard" class="tab-content space-y-6">
+      
+      <!-- Top 4 Metric Cards -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- 1. 预算花费 -->
+        <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-3">
+          <div class="flex items-center justify-between text-slate-400">
+            <span class="text-xs font-medium">月度 API 保守支出</span>
+            <i data-lucide="dollar-sign" class="w-4 h-4 text-sky-400"></i>
+          </div>
+          <div>
+            <div id="dashCost" class="text-2xl font-bold font-mono text-white">¥0.0000</div>
+            <div id="dashCostLimit" class="text-xs text-slate-400">限额: ¥200.00</div>
+          </div>
+          <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+            <div id="dashCostProgress" class="h-2 rounded-full bg-sky-500 transition-all duration-500" style="width: 0%"></div>
+          </div>
+          <div class="flex justify-between text-2xs text-slate-400 font-mono">
+            <span id="dashCostPercent">0% 已用</span>
+            <span>告警阈值: ¥160.00</span>
+          </div>
+        </div>
+
+        <!-- 2. 任务总览 -->
+        <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-3">
+          <div class="flex items-center justify-between text-slate-400">
+            <span class="text-xs font-medium">任务编排历史</span>
+            <i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400"></i>
+          </div>
+          <div>
+            <div id="dashTaskTotal" class="text-2xl font-bold font-mono text-white">0</div>
+            <div class="text-xs text-slate-400">总执行任务数</div>
+          </div>
+          <div class="flex items-center space-x-2 text-xs font-mono">
+            <span id="dashTaskSuccess" class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">0 成功</span>
+            <span id="dashTaskFailed" class="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300">0 失败</span>
+            <span id="dashTaskActive" class="px-2 py-0.5 rounded bg-sky-500/20 text-sky-300">0 进行中</span>
+          </div>
+        </div>
+
+        <!-- 3. Token 统计 -->
+        <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-3">
+          <div class="flex items-center justify-between text-slate-400">
+            <span class="text-xs font-medium">累计 Token 流量</span>
+            <i data-lucide="layers" class="w-4 h-4 text-purple-400"></i>
+          </div>
+          <div>
+            <div id="dashTokensTotal" class="text-2xl font-bold font-mono text-white">0</div>
+            <div class="text-xs text-slate-400">本月 Prompt + Completion</div>
+          </div>
+          <div class="flex justify-between text-2xs font-mono text-slate-400">
+            <span id="dashTokensPrompt">输入: 0</span>
+            <span id="dashTokensCompletion">输出: 0</span>
+          </div>
+        </div>
+
+        <!-- 4. Codex 状态 -->
+        <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-3">
+          <div class="flex items-center justify-between text-slate-400">
+            <span class="text-xs font-medium">Codex 专家与额度</span>
+            <i data-lucide="shield-alert" class="w-4 h-4 text-amber-400"></i>
+          </div>
+          <div>
+            <div id="dashCodexState" class="text-2xl font-bold font-mono text-amber-400">READY</div>
+            <div class="text-xs text-slate-400">本地额度状态机</div>
+          </div>
+          <div class="flex items-center justify-between text-xs font-mono">
+            <span id="dashAuditsPending" class="text-slate-300">0 条待补审</span>
+            <button onclick="App.switchTab('codex')" class="text-sky-400 hover:underline">详情 ➔</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Dashboard Middle Grid -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        
+        <!-- Token Breakdown Chart -->
+        <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-4">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-slate-200">Token 消耗分布</h3>
+            <span class="text-xs text-slate-500 font-mono">模型用量</span>
+          </div>
+          <div class="relative h-56 flex items-center justify-center">
+            <canvas id="tokenChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Recent Tasks Activity -->
+        <div class="lg:col-span-2 p-5 rounded-2xl glass-card border border-slate-800 space-y-4">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-slate-200">最近任务动态</h3>
+            <button onclick="App.switchTab('tasks')" class="text-xs text-sky-400 hover:underline">查看全部任务 ➔</button>
+          </div>
+          <div id="dashRecentTasksList" class="space-y-2.5">
+            <div class="p-6 text-center text-slate-500">加载中...</div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- TAB 2: 任务编排与历史 -->
+    <div id="tab-tasks" class="tab-content hidden space-y-4">
+      
+      <!-- Filter and search bar -->
+      <div class="p-4 rounded-xl glass-card border border-slate-800 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex items-center space-x-3">
+          <span class="text-xs font-medium text-slate-400">状态过滤:</span>
+          <select id="taskStateFilter" onchange="App.state.filters.taskState=this.value; App.refreshCurrentTab();" class="bg-slate-900 border border-slate-700 text-xs text-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-sky-500">
+            <option value="">全部状态 (All)</option>
+            <option value="SUCCESS">SUCCESS (成功)</option>
+            <option value="FAILED">FAILED (失败)</option>
+            <option value="TESTING">TESTING (测试中)</option>
+            <option value="REPAIRING">REPAIRING (自修中)</option>
+            <option value="WAITING_APPROVAL">WAITING_APPROVAL (待审批)</option>
+            <option value="CODEX_BACKLOGGED">CODEX_BACKLOGGED (挂起补审)</option>
+          </select>
+
+          <span class="text-xs font-medium text-slate-400 ml-2">引擎模型:</span>
+          <select id="taskModelFilter" onchange="App.state.filters.taskModel=this.value; App.refreshCurrentTab();" class="bg-slate-900 border border-slate-700 text-xs text-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-sky-500">
+            <option value="">全部模型</option>
+            <option value="glm">GLM Flash</option>
+            <option value="deepseek">DeepSeek Flash</option>
+          </select>
+        </div>
+
+        <button onclick="App.openNewTaskModal()" class="px-3 py-1.5 text-xs font-medium rounded-lg bg-sky-600 hover:bg-sky-500 text-white">
+          + 新建任务
+        </button>
+      </div>
+
+      <!-- Task Table -->
+      <div class="rounded-xl glass-card border border-slate-800 overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-xs">
+            <thead class="bg-slate-900/80 border-b border-slate-800 text-slate-400 font-mono uppercase">
+              <tr>
+                <th class="p-3">Task ID</th>
+                <th class="p-3">需求标题</th>
+                <th class="p-3">主力模型</th>
+                <th class="p-3">状态</th>
+                <th class="p-3">修复轮次</th>
+                <th class="p-3">费用估算</th>
+                <th class="p-3">时间</th>
+              </tr>
+            </thead>
+            <tbody id="tasksTableBody">
+              <tr><td colspan="7" class="p-8 text-center text-slate-500">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- TAB 3: Multica 团队看板 -->
+    <div id="tab-multica" class="tab-content hidden space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-sm font-semibold text-slate-200">Multica 研发看板</h2>
+          <p class="text-xs text-slate-400">无缝协同：Issue 认领、工作树隔离研发、真测试验收与阶段报告回写</p>
+        </div>
+      </div>
+
+      <!-- Kanban 5 Columns -->
+      <div class="grid grid-cols-1 md:grid-cols-5 gap-4 overflow-x-auto">
+        
+        <!-- 待办 Todo -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between text-xs font-medium text-slate-400 pb-2 border-b border-slate-800">
+            <span>待办 (Todo)</span>
+          </div>
+          <div id="kanban-col-todo" class="space-y-3 min-h-[400px]"></div>
+        </div>
+
+        <!-- 执行中 In Progress -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between text-xs font-medium text-sky-400 pb-2 border-b border-sky-800/40">
+            <span>执行中 (In Progress)</span>
+          </div>
+          <div id="kanban-col-in_progress" class="space-y-3 min-h-[400px]"></div>
+        </div>
+
+        <!-- 复核中 In Review -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between text-xs font-medium text-purple-400 pb-2 border-b border-purple-800/40">
+            <span>独立复核 (In Review)</span>
+          </div>
+          <div id="kanban-col-in_review" class="space-y-3 min-h-[400px]"></div>
+        </div>
+
+        <!-- 已完成 Done -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between text-xs font-medium text-emerald-400 pb-2 border-b border-emerald-800/40">
+            <span>已完成 (Done)</span>
+          </div>
+          <div id="kanban-col-done" class="space-y-3 min-h-[400px]"></div>
+        </div>
+
+        <!-- 异常/阻塞 Failed -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between text-xs font-medium text-rose-400 pb-2 border-b border-rose-800/40">
+            <span>异常/阻断 (Blocked)</span>
+          </div>
+          <div id="kanban-col-failed" class="space-y-3 min-h-[400px]"></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- TAB 4: Codex 补审与额度 -->
+    <div id="tab-codex" class="tab-content hidden space-y-6">
+      
+      <!-- Codex Quota Monitor Card -->
+      <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="text-sm font-semibold text-slate-200">Codex 专家调用与额度状态机</h3>
+          <span class="text-xs text-slate-400 font-mono">周额度耗尽自动挂起 · 额度恢复轻量探测补审</span>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 text-xs font-mono">
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">当前额度状态</div>
+            <div id="codexCardState" class="text-base font-bold text-amber-400 mt-1">READY</div>
+          </div>
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">最后检查时间</div>
+            <div id="codexCardLastCheck" class="text-xs text-slate-200 mt-1">-</div>
+          </div>
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">预计恢复时间</div>
+            <div id="codexCardRecovery" class="text-xs text-slate-200 mt-1">未设置</div>
+          </div>
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">状态原因</div>
+            <div id="codexCardReason" class="text-xs text-slate-200 mt-1 truncate">无</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Codex Recovery Time Setting Form -->
+      <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="text-sm font-semibold text-slate-200">设置 Codex 预计恢复时间</h3>
+          <span class="text-xs text-slate-400 font-mono">北京时间 Asia/Shanghai (UTC+08:00)</span>
+        </div>
+
+        <p id="codexRecoveryHint" class="text-xs text-slate-400 leading-relaxed">
+          预计恢复时间用于运行中的恢复监控，在到达该时间后由监控进程发起轻量探测；
+          实际可用性仍由探测确认，设置预计时间不会把额度状态直接标记为已验证 READY，
+          也不会触发任何真实 Codex 探测或补审。输入与回显均按北京时间 (UTC+08:00) 解释，
+          不依赖浏览器所在时区。
+        </p>
+
+        <form id="codexRecoveryForm" class="space-y-3" aria-busy="false">
+          <div class="flex flex-col sm:flex-row sm:items-end gap-3">
+            <div class="flex-1">
+              <label for="codexRecoveryInput" class="block text-xs font-medium text-slate-300 mb-1">
+                预计恢复时间（北京时间）
+              </label>
+              <input
+                type="datetime-local"
+                id="codexRecoveryInput"
+                name="codexRecoveryInput"
+                step="60"
+                aria-describedby="codexRecoveryHint codexRecoveryCurrent"
+                class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+              >
+            </div>
+            <div class="flex items-center space-x-2">
+              <button
+                type="submit"
+                id="codexRecoverySaveBtn"
+                class="px-4 py-2 text-xs font-medium rounded-lg bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                保存预计时间
+              </button>
+              <button
+                type="button"
+                id="codexRecoveryClearBtn"
+                class="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                清除预计时间
+              </button>
+            </div>
+          </div>
+
+          <div class="text-xs text-slate-400">
+            当前已保存时间：
+            <span id="codexRecoveryCurrent" class="font-mono text-slate-200">加载中...</span>
+          </div>
+
+          <div
+            id="codexRecoveryFeedback"
+            class="hidden"
+            role="status"
+            aria-live="polite"
+          ></div>
+        </form>
+      </div>
+
+      <!-- Pending Audits Table -->
+      <div class="space-y-3">
+        <div class="flex items-center justify-between">
+          <h3 class="text-sm font-semibold text-slate-200">待补审与疑难审计队列 (Pending Codex Audits)</h3>
+        </div>
+        <div class="rounded-xl glass-card border border-slate-800 overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-900/80 border-b border-slate-800 text-slate-400 font-mono uppercase">
+                <tr>
+                  <th class="p-3">Audit ID</th>
+                  <th class="p-3">关联 Task</th>
+                  <th class="p-3">严重级别</th>
+                  <th class="p-3">问题描述</th>
+                  <th class="p-3">补审状态</th>
+                  <th class="p-3">挂起时间</th>
+                </tr>
+              </thead>
+              <tbody id="auditsTableBody">
+                <tr><td colspan="6" class="p-8 text-center text-slate-500">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- TAB 5: 预算审计与策略 -->
+    <div id="tab-budget" class="tab-content hidden space-y-6">
+      
+      <!-- Budget Policy Guard Card -->
+      <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-4">
+        <h3 class="text-sm font-semibold text-slate-200">预算守护策略 (Policy Rules)</h3>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs font-mono">
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">月度总预算</div>
+            <div id="policyMonthly" class="text-sm font-bold text-sky-400 mt-1">¥200.00</div>
+          </div>
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">黄色告警阈值</div>
+            <div id="policyWarning" class="text-sm font-bold text-amber-400 mt-1">¥160.00</div>
+          </div>
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">暂停新任务线</div>
+            <div id="policyPause" class="text-sm font-bold text-rose-400 mt-1">¥190.00</div>
+          </div>
+          <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div class="text-slate-400">单任务硬上限</div>
+            <div id="policyTaskLimit" class="text-sm font-bold text-purple-400 mt-1">¥10.00</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Reservations Table -->
+      <div class="space-y-3">
+        <h3 class="text-sm font-semibold text-slate-200">近期并发预留记账流水 (Budget Reservations)</h3>
+        <div class="rounded-xl glass-card border border-slate-800 overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-900/80 border-b border-slate-800 text-slate-400 font-mono uppercase">
+                <tr>
+                  <th class="p-3">Reservation ID</th>
+                  <th class="p-3">Task ID</th>
+                  <th class="p-3">预估费用</th>
+                  <th class="p-3">实际结算</th>
+                  <th class="p-3">状态</th>
+                  <th class="p-3">时间</th>
+                </tr>
+              </thead>
+              <tbody id="reservationsTableBody">
+                <tr><td colspan="6" class="p-8 text-center text-slate-500">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+  </main>
+
+  <!-- MODAL: 新建任务模态框 -->
+  <div id="newTaskModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between pb-3 border-b border-slate-800">
+        <h3 class="text-base font-semibold text-slate-100">发起新编程编排任务</h3>
+        <button onclick="App.closeNewTaskModal()" class="text-slate-400 hover:text-white">✕</button>
+      </div>
+
+      <form onsubmit="App.submitNewTask(event)" class="space-y-4 text-xs">
+        <div>
+          <label class="block text-slate-300 font-medium mb-1">任务标题 (可选)</label>
+          <input type="text" id="newTaskTitle" placeholder="如：实现 LRU 缓存模块并编写单元测试" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500">
+        </div>
+
+        <div>
+          <label class="block text-slate-300 font-medium mb-1">需求描述 (必填) *</label>
+          <textarea id="newTaskReq" rows="3" required placeholder="详细描述功能规格、输入输出和行为要求..." class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono"></textarea>
+        </div>
+
+        <!-- 模型单选二选一 -->
+        <div>
+          <label class="block text-slate-300 font-medium mb-1.5">主力编程模型 (单任务二选一原则)</label>
+          <div class="grid grid-cols-2 gap-3">
+            <label class="flex items-center space-x-2 p-2.5 rounded-xl border border-slate-800 bg-slate-950 cursor-pointer hover:border-sky-500">
+              <input type="radio" name="taskModel" value="glm" checked class="text-sky-500 focus:ring-0">
+              <div class="text-left">
+                <div class="font-medium text-slate-200">GLM Flash</div>
+                <div class="text-2xs text-slate-500">glm-5.3-flash</div>
+              </div>
+            </label>
+            <label class="flex items-center space-x-2 p-2.5 rounded-xl border border-slate-800 bg-slate-950 cursor-pointer hover:border-sky-500">
+              <input type="radio" name="taskModel" value="deepseek" class="text-sky-500 focus:ring-0">
+              <div class="text-left">
+                <div class="font-medium text-slate-200">DeepSeek Flash</div>
+                <div class="text-2xs text-slate-500">deepseek-flash</div>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <!-- 演练模拟与自定义测试 -->
+        <div class="space-y-3 pt-2 border-t border-slate-800">
+          <label class="flex items-center space-x-2 cursor-pointer">
+            <input type="checkbox" id="newTaskMock" checked class="rounded bg-slate-950 border-slate-800 text-sky-500 focus:ring-0">
+            <span class="text-slate-300">使用显式模拟演练 (Mock，不消耗真实 API 费用)</span>
+          </label>
+
+          <div>
+            <label class="block text-slate-400 mb-1">自定义测试验收命令 (可选)</label>
+            <input type="text" id="newTaskTestCmd" placeholder="默认运行 pytest / 自动探测" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono">
+          </div>
+        </div>
+
+        <div class="flex items-center justify-end space-x-3 pt-3 border-t border-slate-800">
+          <button type="button" onclick="App.closeNewTaskModal()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">取消</button>
+          <button type="submit" class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-medium">确认提交</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: 任务详情与多智能体时序流转弹窗 -->
+  <div id="taskDetailModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-3xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+      
+      <!-- Modal Header -->
+      <div class="p-5 border-b border-slate-800 flex items-center justify-between">
+        <div class="space-y-1">
+          <div class="flex items-center space-x-2">
+            <span id="modalTaskId" class="font-mono text-xs text-sky-400 font-bold">task_id</span>
+            <span id="modalTaskState"></span>
+            <span id="modalTaskModel" class="px-2 py-0.5 text-2xs font-mono rounded bg-slate-800 text-slate-300">MODEL</span>
+            <span id="modalTaskCost" class="text-xs text-amber-400 font-mono">¥0.00000</span>
+          </div>
+          <h3 id="modalTaskTitle" class="text-sm font-semibold text-slate-100">Task Title</h3>
+        </div>
+        <button onclick="App.closeTaskDetail()" class="text-slate-400 hover:text-white text-base">✕</button>
+      </div>
+
+      <!-- Modal Body (Scrollable) -->
+      <div class="p-5 overflow-y-auto space-y-5 flex-1 text-xs">
+        
+        <!-- FSM State Machine Visual Flow -->
+        <div class="p-3.5 rounded-xl border border-slate-800 bg-slate-950/70 space-y-1.5">
+          <div class="text-slate-400 font-medium">任务生命周期状态机流转 (FSM Progression)</div>
+          <div id="modalFsmFlow"></div>
+        </div>
+
+        <!-- Task Metadata Grid -->
+        <div class="grid grid-cols-2 gap-3 text-slate-300 font-mono">
+          <div class="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
+            <span class="text-slate-500 block">Git 分支:</span>
+            <span id="modalTaskBranch" class="text-slate-200 truncate block"></span>
+          </div>
+          <div class="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
+            <span class="text-slate-500 block">工作树沙箱路径:</span>
+            <span id="modalTaskWorktree" class="text-slate-200 truncate block"></span>
+          </div>
+        </div>
+
+        <!-- Task Requirement -->
+        <div>
+          <span class="text-slate-400 font-medium block mb-1">原始需求:</span>
+          <div id="modalTaskReq" class="p-3 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 whitespace-pre-wrap"></div>
+        </div>
+
+        <!-- Task Result Summary -->
+        <div>
+          <span class="text-slate-400 font-medium block mb-1">交付结论 / 错误摘要:</span>
+          <div id="modalTaskSummary" class="p-3 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 whitespace-pre-wrap"></div>
+        </div>
+
+        <!-- Execution Timeline Logs -->
+        <div class="space-y-3 pt-3 border-t border-slate-800">
+          <div class="flex items-center justify-between">
+            <h4 class="font-medium text-slate-200">多智能体时序协同执行日志 (Execution Timeline)</h4>
+          </div>
+          <div id="modalTaskLogs" class="space-y-2.5">
+            <div class="p-4 text-center text-slate-500">加载执行步骤...</div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toastContainer" class="fixed bottom-5 right-5 z-50 flex flex-col space-y-2 pointer-events-none"></div>
+
+  <!-- Initialize Application -->
+  <script src="/static/js/codex_recovery.js"></script>
+  <script src="/static/js/app.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      App.init({{ 'true' if mock_default else 'false' }});
+    });
+  </script>
+</body>
+</html>

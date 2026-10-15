@@ -18,7 +18,9 @@ async def test_success_review_redacts_content_and_metadata(monkeypatch, tmp_path
     decoded_password = unquote(password)
     proxy_url = f"http://proxy-user:{quote(decoded_password, safe='')}@127.0.0.1:7890"
     api_key = 'fixture-api-key-"\\secret'
-    echoed = f"Proxy {proxy_url}; password {decoded_password}; key {api_key}"
+    echoed = f"Proxy {proxy_url}; password {decoded_password}"
+    if provider == "gemini":
+        echoed += f"; key {api_key}"
     verdict = {"approved": True, "severity": "P3", "summary": echoed,
                "critical_issues": [echoed], "suggestions": [echoed]}
     monkeypatch.setattr(CodexExpert, "_verify_expected_head", AsyncMock())
@@ -32,9 +34,6 @@ async def test_success_review_redacts_content_and_metadata(monkeypatch, tmp_path
                                        "tools": [], "model": settings.antigravity_review_model}},
             {"event": "result", "result": {"status": "SUCCESS", "structured_output": verdict}},
         ])
-        # This provider has no API key environment, so only proxy echoes are credentials.
-        verdict["summary"] = verdict["critical_issues"][0] = verdict["suggestions"][0] = f"Proxy {proxy_url}; password {decoded_password}"
-        raw = raw.replace(json.dumps(echoed)[1:-1], json.dumps(verdict["summary"])[1:-1])
         context = {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40}
     elif provider == "gemini":
         import agents.gemini_reviewer as module
@@ -44,11 +43,17 @@ async def test_success_review_redacts_content_and_metadata(monkeypatch, tmp_path
     else:
         import agents.codex_expert as module
         agent = module.CodexExpert(cli_cmd="fixture")
-        verdict["summary"] = verdict["critical_issues"][0] = verdict["suggestions"][0] = f"Proxy {proxy_url}; password {decoded_password}"
         raw = json.dumps(verdict)
         context = {"worktree_path": tmp_path, "expected_commit_sha": "a" * 40, "structured_review": True}
     monkeypatch.setattr(module, "get_cli_proxy_env", lambda: proxy_env)
-    monkeypatch.setattr(module, "run_async_command", AsyncMock(return_value=SubprocResult([], 0, raw, "", 0)))
+    async def cli(command, **kwargs):
+        response = raw
+        if provider == "antigravity":
+            events = [json.loads(line) for line in raw.splitlines()]
+            events[0]["init"]["cwd"] = str(kwargs["cwd"])
+            response = "\n".join(json.dumps(event) for event in events)
+        return SubprocResult(command, 0, response, "", 0)
+    monkeypatch.setattr(module, "run_async_command", cli)
     result = await agent.execute("Review", context)
     assert result.success, result.error
     review = result.metadata["review"]

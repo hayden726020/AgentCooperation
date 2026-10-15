@@ -15,6 +15,8 @@ from config.settings import settings
 def get_engine(db_path: str = None):
     target_path = db_path or settings.sqlite_db_path
     path_obj = Path(target_path)
+    if not path_obj.is_absolute():
+        path_obj = (settings.PROJECT_ROOT / path_obj).resolve()
     path_obj.parent.mkdir(parents=True, exist_ok=True)
     sqlite_url = f"sqlite:///{path_obj.as_posix()}"
     return create_engine(sqlite_url, connect_args={"check_same_thread": False})
@@ -26,6 +28,22 @@ engine = get_engine()
 def init_db(target_engine=None):
     use_engine = target_engine or engine
     SQLModel.metadata.create_all(use_engine)
+    with use_engine.connect() as conn:
+        try:
+            res = conn.exec_driver_sql("PRAGMA table_info(tasks)").fetchall()
+            existing_cols = {row[1] for row in res}
+            new_cols = [
+                ("commit_sha", "TEXT"),
+                ("mock_mode", "BOOLEAN DEFAULT 0"),
+                ("reviewer_model", "TEXT"),
+                ("test_passed", "BOOLEAN"),
+            ]
+            for col_name, col_def in new_cols:
+                if col_name not in existing_cols:
+                    conn.exec_driver_sql(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_def}")
+            conn.commit()
+        except Exception:
+            pass
 
 
 def get_session(target_engine=None) -> Session:
