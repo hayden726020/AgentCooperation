@@ -108,7 +108,9 @@ class GeminiDevAgent(BaseAgent):
                                 f"Task Prompt:\n{prompt}\n\n"
                                 "Use view_file/grep_search to inspect, write_to_file/replace_file_content to edit, "
                                 "and run python -m pytest <test_file> -q to test. "
-                                "Do NOT run the entire test suite without arguments. Only use native tools."
+                                "Do NOT run the entire test suite without arguments. If you need a final workspace "
+                                "check, only the exact read-only command `git status` is permitted; do not run any "
+                                "other git command. Only use native tools."
                             ),
                         }
                     ],

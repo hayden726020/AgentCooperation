@@ -292,7 +292,10 @@ def test_project_mode_uses_fixed_workspace_sandbox_and_narrow_native_policy(prov
     assert any("read" in item.lower() and "file" in item.lower() for item in allow)
     assert any("write" in item.lower() and "file" in item.lower() for item in allow)
     assert any("python" in item.lower() and "pytest" in item.lower() for item in allow)
-    assert not any("git status" in item.lower() or "git diff" in item.lower() for item in allow)
+    assert "command(git status)" in allow
+    assert "unsandboxed(git status)" in allow
+    assert not any("git diff" in item.lower() or "git status " in item.lower() for item in allow)
+    assert not any("git status" in item.lower() and "*" in item for item in allow)
     assert any("mcp" in item.lower() for item in deny)
     assert any("url" in item.lower() or "web" in item.lower() for item in deny)
     assert any("unsandboxed" in item.lower() for item in deny)
@@ -350,10 +353,17 @@ def test_pretool_hook_enforces_project_boundary_before_native_tool_execution(pro
     cases = [
         ("allow", {"name": "view_file", "args": {"AbsolutePath": str(workspace / "README.md")}}),
         ("allow", {"name": "run_command", "args": {"CommandLine": "python -m pytest -q", "Cwd": str(workspace)}}),
+        ("allow", {"name": "run_command", "args": {"CommandLine": "git status", "Cwd": str(workspace)}}),
         ("deny", {"name": "write_to_file", "args": {"TargetFile": str(workspace / ".git/config")}}),
         ("deny", {"name": "read_url", "args": {"url": "https://example.invalid"}}),
         ("deny", {"name": "mcp", "args": {"server": "fixture"}}),
-        ("deny", {"name": "run_command", "args": {"CommandLine": "git status", "Cwd": str(workspace)}}),
+        ("deny", {"name": "run_command", "args": {"CommandLine": "git status --short", "Cwd": str(workspace)}}),
+        ("deny", {"name": "run_command", "args": {"CommandLine": "git -c alias.status=!whoami status", "Cwd": str(workspace)}}),
+        ("deny", {"name": "run_command", "args": {"CommandLine": "git --git-dir=../other/.git status", "Cwd": str(workspace)}}),
+        ("deny", {"name": "run_command", "args": {"CommandLine": "git -C .. status", "Cwd": str(workspace)}}),
+        ("deny", {"name": "run_command", "args": {"CommandLine": "git.exe status", "Cwd": str(workspace)}}),
+        ("deny", {"name": "run_command", "args": {"CommandLine": "git  status", "Cwd": str(workspace)}}),
+        ("deny", {"name": "run_command", "args": {"CommandLine": "git\tstatus", "Cwd": str(workspace)}}),
         ("deny", {"name": "run_command", "args": {"CommandLine": "python -m pytest ..", "Cwd": str(workspace)}}),
         ("deny", {"name": "run_command", "args": {"CommandLine": "python -m pytest", "Cwd": str(workspace.parent)}}),
         ("deny", {"name": "view_file", "args": {"AbsolutePath": str(workspace / "subdir/.env")}}),
@@ -466,6 +476,7 @@ def test_project_init_accepts_native_tools_superset(provider_context):
     ("replace_file_content", None, "parameters"),
     ("run_command", "python -m pytest tests/test_module.py -q", "parameters"),
     ("run_command", "python.exe -m pytest -q", "arguments"),
+    ("run_command", "git status", "parameters"),
 ])
 def test_allowlisted_project_tool_steps_are_validated_and_accepted(provider_context, name, command, argument_field):
     profile, module, _, workspace = provider_context
@@ -517,8 +528,15 @@ def test_project_file_tool_rejects_outside_and_sensitive_paths(provider_context,
 
 @pytest.mark.parametrize("command", [
     "git commit -am forbidden",
-    "git status",
     "git diff",
+    "git status --short",
+    "git status --porcelain",
+    "git -c alias.status=!whoami status",
+    "git --git-dir=../other/.git status",
+    "git -C .. status",
+    "git.exe status",
+    "git  status",
+    "git\tstatus",
     "git status; whoami",
     "git diff && whoami",
     "git diff --no-index .. outside",
