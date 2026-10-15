@@ -129,7 +129,7 @@ def desired_config(bot: dict) -> dict:
         "fallback_providers": [], "smart_model_routing": {"enabled": False},
         "platform_toolsets": {platform: list(bot["tools"]) for platform in sorted(platforms)},
         "toolsets": list(bot["tools"]),
-        "plugins": {"enabled": [], "disabled": ["agent_cooperation"]},
+        "plugins": {"enabled": ["agent_cooperation"], "disabled": []} if bot.get("provider") in {"gemini", "antigravity-cli"} else {"enabled": [], "disabled": ["agent_cooperation"]},
         "mcp_servers": {}, "auxiliary": auxiliary,
         "curator": {"enabled": False, "consolidate": False},
         "compression": {"enabled": False},
@@ -226,6 +226,8 @@ def inspect_profiles(home: Path) -> list[dict]:
             "cli_binary_found": _check_cli_binary_available(provider),
             "cli_auth_present": _check_cli_auth_present(channel),
             "read_only_enforced": len(cfg.get("platform_toolsets", {}).get("cli", bot["tools"])) == 0 if name in {"coop-review", "coop-expert"} else False,
+            "plugins_enabled": cfg.get("plugins", {}).get("enabled", []),
+            "plugins_disabled": cfg.get("plugins", {}).get("disabled", []),
         })
     return result
 
@@ -309,6 +311,7 @@ def configure(home: Path, *, dry_run: bool = False, sync_review_key: bool = Fals
             config = merge(read_config(profile / "config.yaml"), wanted)
             config["model"] = wanted["model"]
             config["providers"] = wanted.get("providers", {})
+            config["plugins"] = wanted.get("plugins", {})
             config["mcp_servers"] = {}
             atomic_config_replace(profile / "config.yaml", config)
             soul = soul_text(bot)

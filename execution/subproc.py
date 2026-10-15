@@ -75,8 +75,12 @@ async def run_async_command(
     """
     start_time = time.time()
     
-    # 构造非交互式环境变量
-    merged_env = {key: value for key, value in os.environ.items() if key.upper() in SAFE_ENV_KEYS}
+    # 构造非交互式环境变量，剥离敏感凭据
+    sensitive_substrings = ("KEY", "SECRET", "TOKEN", "AUTH", "PASSWORD", "PASS", "CREDENTIAL", "AWS", "GITHUB", "OPENAI", "ZHIPU", "DEEPSEEK")
+    merged_env = {
+        key: value for key, value in os.environ.items()
+        if key.upper() in SAFE_ENV_KEYS and not any(sub in key.upper() for sub in sensitive_substrings)
+    }
     merged_env.update({
         "CI": "1",
         "NONINTERACTIVE": "1",

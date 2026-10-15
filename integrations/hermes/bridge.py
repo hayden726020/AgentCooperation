@@ -88,7 +88,8 @@ class HermesCooperationBridge:
     # -------------------------------------------------------------------------
     def validate_repo_root(self, repo_root: Optional[Union[str, Path]]) -> Path:
         """Validate that repo_root is authorized, exists, and is a valid Git repository."""
-        target = Path(repo_root) if repo_root else self.repo_root
+        clean_root = repo_root.strip('\'" \t\r\n') if isinstance(repo_root, str) else repo_root
+        target = Path(clean_root) if clean_root else self.repo_root
         if not target.is_absolute():
             target = (self.repo_root / target).resolve()
         else:
@@ -789,6 +790,7 @@ class HermesCooperationBridge:
         reviewer_choice: Literal["glm", "deepseek"] = "glm",
         mock_mode: bool = False,
         custom_test_cmd: Optional[str] = None,
+        test_paths: Optional[list[str]] = None,
         max_repair_attempts: Optional[int] = None,
     ) -> HermesTaskResponse:
         """Execute the end-to-end Gemini Dev + GLM/DeepSeek Review closed loop."""
@@ -807,8 +809,9 @@ class HermesCooperationBridge:
             title=title,
             mock_mode=mock_mode,
             custom_test_cmd=custom_test_cmd,
+            test_paths=test_paths,
         )
-        with self._provide_session() as s:
+        with loop._provide_session(mock_mode=mock_mode) as s:
             task = s.exec(select(Task).where(Task.task_id == result.task_id)).first()
             if task:
                 return self._build_task_response(task, deduplicated=False)

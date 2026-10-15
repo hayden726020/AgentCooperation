@@ -35,7 +35,8 @@ async def run_pipeline(
     mock: bool,
     max_retries: int,
     repo_root: Path,
-    custom_test_cmd: str | None = None,
+    test_paths: list[str] | None = None,
+    allow_untrusted_tests: bool = False,
 ) -> int:
     orchestrator = GeminiClosedLoopOrchestrator(
         repo_root=repo_root,
@@ -50,7 +51,8 @@ async def run_pipeline(
     result = await orchestrator.run(
         requirement=requirement,
         mock_mode=mock,
-        custom_test_cmd=custom_test_cmd,
+        test_paths=test_paths,
+        allow_untrusted_tests=allow_untrusted_tests,
     )
 
     output_data = {
@@ -99,12 +101,18 @@ def main() -> int:
         default=PROJECT_ROOT,
         help="Root path of target repository (default: current project root)",
     )
-
     parser.add_argument(
-        "--test-cmd",
-        type=str,
+        "--test-path",
+        action="append",
+        dest="test_paths",
         default=None,
-        help="Optional custom test command to execute in worktree",
+        help="Optional safe relative test file path within worktree (can be repeated)",
+    )
+    parser.add_argument(
+        "--allow-untrusted-tests",
+        action="store_true",
+        default=False,
+        help="Allow executing newly generated test code without pausing for approval",
     )
 
     args = parser.parse_args()
@@ -115,10 +123,10 @@ def main() -> int:
             mock=args.mock,
             max_retries=args.max_retries,
             repo_root=args.repo_root,
-            custom_test_cmd=args.test_cmd,
+            test_paths=args.test_paths,
+            allow_untrusted_tests=args.allow_untrusted_tests,
         )
     )
-
 
 
 if __name__ == "__main__":

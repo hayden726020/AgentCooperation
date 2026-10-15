@@ -62,9 +62,18 @@ class GeminiDevAgent(BaseAgent):
                 # Default mock behavior if no explicit files are provided:
                 # Ensure at least one implementation file exists so checkpointing works.
                 sample_file = worktree / "solution.py"
-                if not sample_file.exists():
-                    sample_file.write_text("# Simulated implementation\nVALUE = 42\n", encoding="utf-8")
-                    files_written.append(str(sample_file))
+                count = 1
+                if sample_file.exists():
+                    try:
+                        content = sample_file.read_text(encoding="utf-8")
+                        count = len(content.splitlines()) + 1
+                    except Exception:
+                        count = 2
+                sample_file.write_text(
+                    f"# Simulated implementation\nVALUE = {42 + count}\n# Iteration {count}\n",
+                    encoding="utf-8",
+                )
+                files_written.append(str(sample_file))
 
             return AgentResult(
                 success=True,

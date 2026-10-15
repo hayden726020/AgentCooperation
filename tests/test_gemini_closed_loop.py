@@ -574,3 +574,205 @@ async def test_mock_vs_real_db_isolation(mock_git_repo, tmp_path):
         task_real = rs.exec(select(Task).where(Task.task_id == result.task_id)).first()
         assert task_real is None
 
+
+def test_safe_test_path_validation_and_attack_rejection(mock_git_repo):
+    """Test safe test path validation rejects traversals, flags, shell chars, and symlinks."""
+    from orchestrator.gemini_closed_loop import validate_safe_test_paths
+
+    # Valid relative path exists
+    assert validate_safe_test_paths(["test_calc.py"], mock_git_repo) == ["test_calc.py"]
+
+    # Rejects path traversal
+    with pytest.raises(ValueError, match="Path traversal"):
+        validate_safe_test_paths(["../outside.py"], mock_git_repo)
+
+    # Rejects absolute paths
+    with pytest.raises(ValueError, match="Absolute test paths disallowed"):
+        validate_safe_test_paths(["/etc/passwd"], mock_git_repo)
+    with pytest.raises(ValueError, match="Absolute test paths disallowed"):
+        validate_safe_test_paths(["C:/Windows/calc.exe"], mock_git_repo)
+
+    # Rejects flag options
+    with pytest.raises(ValueError, match="Flag arguments not permitted"):
+        validate_safe_test_paths(["-p"], mock_git_repo)
+    with pytest.raises(ValueError, match="Flag arguments not permitted"):
+        validate_safe_test_paths(["--rootdir=.."], mock_git_repo)
+
+    # Rejects shell metacharacters
+    for bad_char in [";", "&", "|", "`", "$", "<", ">", "\n"]:
+        with pytest.raises(ValueError, match="Disallowed character"):
+            validate_safe_test_paths([f"test_calc.py{bad_char}id"], mock_git_repo)
+
+    # Rejects nonexistent files when worktree is provided
+    with pytest.raises(ValueError, match="Test path does not exist"):
+        validate_safe_test_paths(["test_nonexistent.py"], mock_git_repo)
+
+
+def test_test_runner_hardened_env(mock_git_repo, monkeypatch):
+    """Verify subprocess environment cleans credentials, sets sandbox dirs and disables plugins."""
+    from execution.test_runner import TestRunner
+
+    # Inject mock sensitive credentials into current environment
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-12345")
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-zhipu-token")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_1234567890abcdefghijklmnopqrstuvwxyz")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:8080")
+
+    runner = TestRunner(mock_git_repo, test_paths=["test_calc.py"])
+    env = runner.build_env(mock_git_repo)
+
+    # Credential stripping
+    for key in ("OPENAI_API_KEY", "ZHIPU_API_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"):
+        assert key not in env
+
+    # Proxy isolation
+    assert "HTTP_PROXY" not in env
+    assert "HTTPS_PROXY" not in env
+
+    # Sandbox isolation
+    assert env.get("PYTHONNOUSERSITE") == "1"
+    assert env.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD") == "1"
+    assert ".test_sandbox" in env.get("TEMP", "")
+    assert ".test_sandbox" in env.get("USERPROFILE", "")
+
+
+@pytest.mark.asyncio
+async def test_untrusted_test_approval_gate(mock_git_repo, test_db_session):
+    """Test that newly generated test files trigger WAITING_APPROVAL when allow_untrusted_tests is False."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+
+    dev_agent = GeminiDevAgent(mock_mode=True)
+    async def fake_dev_execute(prompt, context=None):
+        wt = Path(context["worktree_path"])
+        test_file = wt / "test_untrusted.py"
+        test_file.write_text("def test_foo(): assert True\n", encoding="utf-8")
+        return AgentResult(
+            success=True,
+            content="Added test_untrusted.py",
+            metadata={"files_written": [str(test_file)], "native_tool_steps": [{"name": "write_to_file", "succeeded": True}]},
+        )
+
+    with patch.object(dev_agent, "execute", side_effect=fake_dev_execute):
+        result = await orchestrator.run(
+            requirement="Add new feature with test",
+            mock_mode=False,
+            dev_agent=dev_agent,
+            allow_untrusted_tests=False,
+        )
+
+    assert result.success is False
+    assert result.state == "WAITING_APPROVAL"
+    assert "Untrusted test code generated or modified" in result.result_summary
+
+
+@pytest.mark.asyncio
+async def test_sensitive_file_modification_aborts_task(mock_git_repo, test_db_session):
+    """Test that writing to sensitive files like .env or keys immediately halts execution."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+
+    dev_agent = GeminiDevAgent(mock_mode=True)
+    async def fake_sensitive_execute(prompt, context=None):
+        wt = Path(context["worktree_path"])
+        env_file = wt / ".env"
+        env_file.write_text("SECRET=bad\n", encoding="utf-8")
+        return AgentResult(
+            success=True,
+            content="Touched .env",
+            metadata={"files_written": [str(env_file)], "native_tool_steps": [{"name": "write_to_file", "succeeded": True}]},
+        )
+
+    with patch.object(dev_agent, "execute", side_effect=fake_sensitive_execute):
+        result = await orchestrator.run(
+            requirement="Modify secret configs",
+            mock_mode=False,
+            dev_agent=dev_agent,
+        )
+
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert "Security violation" in result.result_summary
+
+
+def test_advanced_evidence_redaction():
+    """Verify AWS, GitHub tokens, PEM keys, and DB URIs are redacted."""
+    raw = (
+        "AWS Key: AKIAIOSFODNN7EXAMPLE\n"
+        "GitHub PAT: ghp_1234567890abcdefghijklmnopqrstuvwxyz1234\n"
+        "GitHub Fine-grained: github_pat_11AEXAMPLE0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuv\n"
+        "Postgres: postgres://dbuser:supersecretpass@db.internal:5432/main\n"
+        "Key: -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0\n-----END RSA PRIVATE KEY-----\n"
+    )
+    redacted = redact_and_truncate_evidence(raw)
+    assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+    assert "[REDACTED_AWS_KEY]" in redacted
+    assert "ghp_1234567890" not in redacted
+    assert "[REDACTED_GITHUB_TOKEN]" in redacted
+    assert "supersecretpass" not in redacted
+    assert "[REDACTED_DB_CREDENTIALS]" in redacted
+    assert "MIIEow" not in redacted
+    assert "[REDACTED_PRIVATE_KEY]" in redacted
+
+
+@pytest.mark.asyncio
+async def test_hermes_slash_command_and_cli_dispatch(mock_git_repo, test_db_session):
+    """Verify /coop loop and MCP invoke bridge and closed loop orchestrator."""
+    from plugins.agent_cooperation.commands import handle_coop_command
+    from plugins.agent_cooperation.tools import get_bridge
+    from integrations.hermes.mcp_server import handle_tool_call
+
+    bridge = get_bridge()
+    bridge.session = test_db_session
+    bridge.policy.security.allowed_repos = [str(mock_git_repo)]
+
+    # 1. Test /coop loop
+    repo_arg = mock_git_repo.as_posix()
+    cmd_output = await handle_coop_command(f'loop "Add mock function" --mock --repo "{repo_arg}"')
+    assert "Task:" in cmd_output
+    assert "SUCCESS" in cmd_output
+
+    # 2. Test MCP tool dispatch
+    mcp_res = await handle_tool_call(
+        "coop_run_gemini_closed_loop",
+        {"requirement": "Add test feature via MCP", "mock_mode": True, "repo_root": str(mock_git_repo)},
+    )
+    assert mcp_res["status"] == "SUCCESS"
+    assert "task_id" in mcp_res
+
+
+def test_hermes_coop_cli_dispatch(mock_git_repo):
+    """Verify hermes coop loop CLI parser & dispatch executes cleanly in synchronous context."""
+    from plugins.agent_cooperation.cli import register_cli
+    from plugins.agent_cooperation.tools import get_bridge
+    import argparse
+
+    bridge = get_bridge()
+    bridge.session = None
+    bridge.policy.security.allowed_repos = [str(mock_git_repo)]
+
+    parser = argparse.ArgumentParser(prog="hermes coop")
+    register_cli(parser)
+    parsed_args = parser.parse_args(["loop", "Add test via CLI", "--mock", "--repo", str(mock_git_repo)])
+    assert parsed_args.coop_action == "loop"
+    cli_rc = parsed_args.func(parsed_args)
+    assert cli_rc == 0
+
+
+def test_recursive_test_discovery(mock_git_repo):
+    """Verify _test_paths discovers tests inside nested subdirectories."""
+    nested = mock_git_repo / "tests" / "unit"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "test_nested.py").write_text("def test_nested(): pass\n", encoding="utf-8")
+
+    paths = GeminiClosedLoopOrchestrator._test_paths(mock_git_repo, [])
+    assert "tests/unit/test_nested.py" in paths
+
+

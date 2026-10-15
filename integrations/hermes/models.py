@@ -15,6 +15,7 @@ class HermesSubmitRequest(BaseModel):
     title: Optional[str] = None
     mock_mode: bool = False
     custom_test_cmd: Optional[str] = None
+    test_paths: Optional[List[str]] = None
     idempotency_key: Optional[str] = None
 
 

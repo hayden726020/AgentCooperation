@@ -144,7 +144,7 @@ TOOLS = [
                 "reviewer": {"type": "string", "enum": ["glm", "deepseek"], "description": "Independent reviewer choice"},
                 "title": {"type": "string", "description": "Task title"},
                 "mock_mode": {"type": "boolean", "description": "Run in simulation mode"},
-                "custom_test_cmd": {"type": "string", "description": "Custom test command override"},
+                "test_paths": {"type": "array", "items": {"type": "string"}, "description": "Safe relative test file paths"},
                 "max_repair_attempts": {"type": "integer", "description": "Maximum repair attempts (default 3)"},
             },
             "required": ["requirement"],
@@ -162,7 +162,7 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Any:
             title=arguments.get("title"),
             reviewer_choice=arguments.get("reviewer", "glm"),
             mock_mode=bool(arguments.get("mock_mode", False)),
-            custom_test_cmd=arguments.get("custom_test_cmd"),
+            test_paths=arguments.get("test_paths"),
             max_repair_attempts=arguments.get("max_repair_attempts"),
         )
         return res.model_dump()

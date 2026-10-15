@@ -38,7 +38,11 @@ def _core_scope(mock=False, repo_root=None):
         yield OrchestratorCore(repo_root=repo_root)
         return
     path = Path(settings.sqlite_db_path)
-    mock_path = path.with_name(f"{path.stem}.mock{path.suffix or '.db'}")
+    if path.name == "agent_orchestrator.db":
+        mock_path = Path(settings.mock_sqlite_db_path)
+    else:
+        mock_path = path.with_name(f"{path.stem}.mock{path.suffix or '.db'}")
+    mock_path.parent.mkdir(parents=True, exist_ok=True)
     engine = get_engine(str(mock_path))
     try:
         with get_session(engine) as session:

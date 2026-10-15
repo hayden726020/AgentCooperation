@@ -29,6 +29,8 @@ class Task(SQLModel, table=True):
     mock_mode: bool = False
     reviewer_model: Optional[str] = None
     test_passed: Optional[bool] = None
+    repo_root: Optional[str] = None
+    base_ref: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     completed_at: Optional[datetime] = None

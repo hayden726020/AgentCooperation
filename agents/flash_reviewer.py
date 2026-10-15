@@ -69,10 +69,11 @@ class FlashReviewer(BaseAgent):
             "https://open.bigmodel.cn/api/paas/v4" if model_key == "glm" else "https://api.deepseek.com/v1"
         )
         if not mock_mode and not self.api_key:
-            raise ValueError(f"Missing API key for reviewer {model_key}; specify api_key or mock_mode=True")
-        self.client = None if mock_mode else AsyncOpenAI(
-            api_key=self.api_key, base_url=self.base_url, max_retries=1, timeout=90.0
-        )
+            self.client = None
+        else:
+            self.client = None if mock_mode else AsyncOpenAI(
+                api_key=self.api_key, base_url=self.base_url, max_retries=1, timeout=90.0
+            )
 
     def calculate_cost_cny(self, prompt_tokens: int, completion_tokens: int) -> float:
         input_price = self.pricing.input_price_per_m_usd
@@ -103,7 +104,21 @@ class FlashReviewer(BaseAgent):
                 success=True,
                 content=json.dumps(verdict, ensure_ascii=False),
                 duration_s=time.monotonic() - start,
-                metadata={"review": verdict, "mock": True, "reviewer_model": self.model_name},
+                metadata={
+                    "review": verdict,
+                    "mock": True,
+                    "reviewer_model": self.model_name,
+                    "server_model": self.model_name,
+                },
+            )
+
+        if not self.mock_mode and (not self.api_key or self.client is None):
+            return AgentResult(
+                success=False,
+                content="",
+                duration_s=time.monotonic() - start,
+                error=f"Missing API key for reviewer {self.model_key}; specify api_key or mock_mode=True",
+                metadata={"mock": False, "reviewer_model": self.model_name},
             )
 
         try:
@@ -138,6 +153,7 @@ class FlashReviewer(BaseAgent):
             parsed = parse_review_output(raw_text)
             verdict = redact_review_credentials(parsed, credential_env)
 
+            server_model = getattr(response, "model", self.model_name)
             prompt_tokens = response.usage.prompt_tokens if response.usage else 0
             completion_tokens = response.usage.completion_tokens if response.usage else 0
             cost_cny = self.calculate_cost_cny(prompt_tokens, completion_tokens)
@@ -149,14 +165,24 @@ class FlashReviewer(BaseAgent):
                 completion_tokens=completion_tokens,
                 cost_cny=cost_cny,
                 duration_s=time.monotonic() - start,
-                metadata={"review": verdict, "mock": False, "reviewer_model": self.model_name},
+                metadata={
+                    "review": verdict,
+                    "mock": False,
+                    "reviewer_model": self.model_name,
+                    "server_model": server_model,
+                },
             )
         except Exception as exc:
             safe_error = redact_credentials(f"{self.model_key.upper()} review incomplete: {exc}", credential_env)
+            is_deepseek_blocked = self.model_key == "deepseek"
             return AgentResult(
                 success=False,
                 content="",
                 duration_s=time.monotonic() - start,
                 error=safe_error,
-                metadata={"mock": False, "reviewer_model": self.model_name},
+                metadata={
+                    "mock": False,
+                    "reviewer_model": self.model_name,
+                    "status": "BLOCKED_EXTERNAL" if is_deepseek_blocked else "FAILED",
+                },
             )

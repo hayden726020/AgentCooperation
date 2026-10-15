@@ -7,9 +7,9 @@
 | 入口 | 当前实现 |
 | --- | --- |
 | 自动编排 CLI / Web / Hermes bridge | 每任务 GLM 或 DeepSeek 一个 Flash 引擎负责规划、开发、修复；默认 Antigravity CLI 复核；Codex CLI 专家和补审。以 `config/policy.yaml`、`orchestrator/engine_selector.py` 为准 |
-| 手动 Hermes Profiles | `scripts/configure_hermes_bots.py` 配置 Gemini dev、GLM review、Codex expert；关闭 agent_cooperation 插件和 MCP。这不代表自动流水线已迁移角色 |
-| Hermes 内部 Gemini 实验对话 | `chat coop-dev` 经注册 Provider / AIAgent 调用订阅 CLI；本机已显式启用，真实短回复通过。每请求隔离原生 HOME / 工作目录、禁用工具，继承现有系统代理；不使用 Gemini API 密钥。仅文本对话，研发工具闭环未实现 |
-| Gemini 研发 + 独立复核闭环（阶段五） | `scripts/gemini_closed_loop.py` / `orchestrator/gemini_closed_loop.py` / Hermes 插件 `coop_run_gemini_closed_loop`：Gemini 负责工作树内开发与修复；GLM / DeepSeek 担任只读独立复核；实现任务交接、产物传递（commit SHA / diff / test）、结论回传与有界失败重试（P0 拦截审批）。已完成阶段四真实工具探针与阶段五正式接入真实验收 |
+| 手动 Hermes Profiles | `scripts/configure_hermes_bots.py` 配置 Gemini dev、GLM review、Codex expert；`coop-dev` 已启用 `agent_cooperation` 插件。这不代表旧版自动流水线已迁移角色 |
+| Hermes 内部 Gemini 实验对话 | `chat coop-dev` 经注册 Provider / AIAgent 调用订阅 CLI；本机已显式启用，真实短回复通过。每请求隔离原生 HOME / 工作目录、禁用模型直接工具调用，继承现有系统代理；不使用 Gemini API 密钥。闭环通过本地 `/coop loop` 或 CLI 分发 |
+| Gemini 研发 + 独立复核闭环（阶段五） | `scripts/gemini_closed_loop.py` / `orchestrator/gemini_closed_loop.py` / Hermes 插件 `coop_run_gemini_closed_loop`：Gemini 负责工作树内开发与修复；GLM / DeepSeek 担任只读独立复核；实现任务交接、产物传递（commit SHA / diff / test）、结论回传与有界失败重试（P0 拦截审批）。已完成阶段四真实工具探针与阶段五正式接入真实验收及安全加固 |
 | 用户直接使用 Gemini 研发 | `scripts/hermes_bots.ps1 direct coop-dev` 前台启动原生 Antigravity CLI，启动参数指定 `gemini-3.8-flash-high / high`，复用原生登录；任务文件与 diff / 测试证据人工交接，不经过 Hermes 模型 Provider，不自动调用复核 |
 
 
@@ -34,7 +34,7 @@
 - **阶段四真实工具链探针**：2026-10-15 通过 `scripts/probe_hermes_gemini_tools.py` 验证完成（5 原生工具步骤，`HERMES_GEMINI_PROJECT_OK`）。
 - **阶段五正式闭环接入**：2026-10-15 完成三次真实验收（真实工具探针、Gemini + GLM FlashX、Gemini + DeepSeek Flash，全部 SUCCESS 并物理结算）。
 - **模型渠道与验证**：研发模型固定为 `gemini-3.8-flash-high`；复核模型固定为 `glm-5.3-flashx`；可选复核 `deepseek-flash` 已经官方模型列表核验通过；专家保留 `gpt-6.1-sol`。
-- **全量离线回归**：571 passed, 28 skipped (0 failed)。
+- **全量离线回归**：579 passed, 28 skipped (0 failed)。
 - 历史旧库与旧流水线说明见归档验收报告；阶段五最新真实数据详见 [阶段五真实验收报告](STAGE5_ACCEPTANCE_2026-10-15.md)。
 
 ## 上下文读取规则

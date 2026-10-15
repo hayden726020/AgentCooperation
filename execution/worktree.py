@@ -85,11 +85,23 @@ class WorktreeManager:
             raise RuntimeError(f"Cannot inspect staged checkpoint: {changed.stderr}")
         return await self._git(["rev-parse", "HEAD"], path)
 
-    async def get_diff(self, worktree_path: Path, base_ref: str | None = None) -> str:
+    async def get_head_sha(self, worktree_path: Path) -> str:
+        path = await self._validate_worktree(worktree_path)
+        return await self._git(["rev-parse", "HEAD"], path)
+
+    async def get_tree_hash(self, worktree_path: Path, ref: str = "HEAD") -> str:
+        path = await self._validate_worktree(worktree_path)
+        return await self._git(["rev-parse", f"{ref}^{{tree}}"], path)
+
+    async def get_diff(self, worktree_path: Path, base_ref: str | None = None, target_ref: str | None = None) -> str:
         path = await self._validate_worktree(worktree_path)
         base = base_ref or await self.get_base_ref(path)
         if not re.fullmatch(r"[a-fA-F0-9]{40,64}", base):
             raise ValueError("Diff requires a fixed base commit SHA")
+        if target_ref:
+            if not re.fullmatch(r"[a-fA-F0-9]{40,64}", target_ref):
+                raise ValueError("Target diff requires a fixed commit SHA")
+            return await self._git(["diff", "--no-ext-diff", f"{base}..{target_ref}", "--"], path)
         return await self._git(["diff", "--no-ext-diff", base, "--"], path)
 
     async def rollback(self, worktree_path: Path, target_sha: str) -> bool:

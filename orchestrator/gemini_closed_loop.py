@@ -36,12 +36,35 @@ logger = logging.getLogger(__name__)
 _SENSITIVE_PATTERNS = [
     (re.compile(r"(?i)(api[_-]?key|secret|token|password|bearer|authorization)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,})['\"]?"), r"\1=[REDACTED]"),
     (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "[REDACTED_API_KEY]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_KEY]"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,255}"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{82}"), "[REDACTED_GITHUB_PAT]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+    (re.compile(r"(?i)(postgres|postgresql|mysql|mongodb|redis):\/\/[^\s:]+:[^\s@]+@[^\s\/]+"), r"\1://[REDACTED_DB_CREDENTIALS]"),
     (re.compile(r"Bearer\s+ya29\.[A-Za-z0-9_\-]+", re.IGNORECASE), "Bearer [REDACTED_OAUTH_TOKEN]"),
     (re.compile(r"ya29\.[A-Za-z0-9_\-]+"), "[REDACTED_OAUTH_TOKEN]"),
 ]
 
+_SENSITIVE_FILES_PATTERN = re.compile(
+    r"(^|[\/\\])(\.env(\..+)?|\.git|\.aws|\.codex|id_rsa|id_ed25519|.*\.pem|.*\.key)$",
+    re.IGNORECASE,
+)
 
-def redact_and_truncate_evidence(content: str, max_chars: int = 60000) -> str:
+
+def contains_sensitive_files(paths: list[str]) -> tuple[bool, str]:
+    """Check if any path matches sensitive patterns (.env, .git, .aws, keys, certs)."""
+    for p in paths:
+        p_clean = p.replace("\\", "/").strip("/")
+        parts = p_clean.split("/")
+        for part in parts:
+            if _SENSITIVE_FILES_PATTERN.match(part):
+                return True, p
+        if _SENSITIVE_FILES_PATTERN.match(p_clean):
+            return True, p
+    return False, ""
+
+
+def redact_and_truncate_evidence(content: str, max_chars: int = 40000) -> str:
     if not content:
         return ""
     text = content
@@ -55,13 +78,61 @@ def redact_and_truncate_evidence(content: str, max_chars: int = 60000) -> str:
 def validate_custom_test_cmd(cmd: str | None) -> None:
     if not cmd:
         return
-    forbidden_patterns = [r"[;&|`$]", r"\b(rm|del|rmdir|shutil|curl|wget|bash|sh|cmd|powershell|pwsh)\b"]
+    forbidden_patterns = [
+        r"[;&|`$<>\n\r]",
+        r"\b(rm|del|rmdir|shutil|curl|wget|bash|sh|cmd|powershell|pwsh)\b",
+        r"(?:^|\s)-p\b",
+        r"(?:^|\s)--rootdir\b",
+        r"(?:^|\s)--confcutdir\b",
+        r"\.\.",
+    ]
     for pat in forbidden_patterns:
         if re.search(pat, cmd, re.IGNORECASE):
             raise ValueError(f"Custom test command contains disallowed patterns: {cmd}")
     allowed_prefixes = ("python -m pytest", "python.exe -m pytest", "pytest", "pytest.exe")
-    if not any(cmd.strip().startswith(prefix) for prefix in allowed_prefixes):
+    cleaned = cmd.strip()
+    matched = False
+    for prefix in allowed_prefixes:
+        if cleaned == prefix or cleaned.startswith(prefix + " "):
+            matched = True
+            break
+    if not matched:
         raise ValueError(f"Custom test command must start with approved test runner (python -m pytest / pytest): {cmd}")
+
+
+def validate_safe_test_paths(paths: Optional[list[str]], worktree: Optional[Path] = None) -> list[str]:
+    """Validate relative test paths against shell injections, path traversals, flags and symlinks."""
+    if not paths:
+        return []
+    safe_paths: list[str] = []
+    forbidden_chars = [";", "&", "|", "`", "$", "<", ">", "\n", "\r", "\x00"]
+    for p in paths:
+        p_str = str(p).strip()
+        if not p_str:
+            continue
+        for ch in forbidden_chars:
+            if ch in p_str:
+                raise ValueError(f"Disallowed character '{ch}' in test path: {p_str}")
+        if p_str.startswith("-"):
+            raise ValueError(f"Flag arguments not permitted in test paths: {p_str}")
+        p_obj = Path(p_str)
+        if p_obj.is_absolute() or p_str.startswith("/") or p_str.startswith("\\"):
+            raise ValueError(f"Absolute test paths disallowed: {p_str}")
+        if ".." in p_obj.parts:
+            raise ValueError(f"Path traversal ('..') disallowed: {p_str}")
+        if worktree is not None:
+            resolved_worktree = worktree.resolve()
+            target = (worktree / p_str).resolve()
+            try:
+                target.relative_to(resolved_worktree)
+            except ValueError:
+                raise ValueError(f"Test path resolves outside worktree: {p_str}")
+            if not target.exists():
+                raise ValueError(f"Test path does not exist: {p_str}")
+            if target.is_symlink():
+                raise ValueError(f"Symlink test paths disallowed: {p_str}")
+        safe_paths.append(p_str)
+    return safe_paths
 
 
 @dataclass
@@ -76,6 +147,8 @@ class DevelopmentArtifacts:
     test_summary: str
     generated_files: list[str] = field(default_factory=list)
     repair_attempts: int = 0
+    tree_hash: Optional[str] = None
+    evidence_id: Optional[str] = None
 
 
 @dataclass
@@ -88,6 +161,7 @@ class ReviewVerdict:
     critical_issues: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     reviewer_model: str = "glm-5.3-flashx"
+    server_model: Optional[str] = None
 
 
 @dataclass
@@ -129,11 +203,27 @@ class GeminiClosedLoopOrchestrator:
             else getattr(self.policy.repair, "max_normal_attempts", 3)
         )
 
+    @staticmethod
+    def _is_production_session(session: Optional[Session]) -> bool:
+        if session is None:
+            return False
+        try:
+            bind = session.get_bind()
+            if bind and bind.url:
+                db_name = str(bind.url.database or "")
+                prod_name = Path(settings.sqlite_db_path).name
+                if db_name.endswith(prod_name) and not db_name.endswith("mock_" + prod_name):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _provide_session(self, mock_mode: bool = False):
         if self.session is not None:
-            return provide_session(self.session)
+            if not (mock_mode and self._is_production_session(self.session)):
+                return provide_session(self.session)
         if mock_mode:
-            mock_db_path = PROJECT_ROOT / "data/mock_agent_orchestrator.db"
+            mock_db_path = PROJECT_ROOT / settings.mock_sqlite_db_path
             mock_db_path.parent.mkdir(parents=True, exist_ok=True)
             mock_engine = get_engine(str(mock_db_path))
             init_db(mock_engine)
@@ -169,9 +259,10 @@ class GeminiClosedLoopOrchestrator:
 
     def _get_budget_guard(self, mock_mode: bool = False) -> BudgetGuard:
         if self.session is not None:
-            return BudgetGuard(self.policy.budget, self.session)
+            if not (mock_mode and self._is_production_session(self.session)):
+                return BudgetGuard(self.policy.budget, self.session)
         if mock_mode:
-            mock_db_path = PROJECT_ROOT / "data/mock_agent_orchestrator.db"
+            mock_db_path = PROJECT_ROOT / settings.mock_sqlite_db_path
             mock_db_path.parent.mkdir(parents=True, exist_ok=True)
             mock_engine = get_engine(str(mock_db_path))
             init_db(mock_engine)
@@ -227,7 +318,7 @@ class GeminiClosedLoopOrchestrator:
                 paths.add(relative.as_posix())
         tests_dir = worktree / "tests"
         if tests_dir.is_dir():
-            for path in (*tests_dir.glob("test_*.py"), *tests_dir.glob("*_test.py")):
+            for path in (*tests_dir.rglob("test_*.py"), *tests_dir.rglob("*_test.py")):
                 if path.is_file() and not path.is_symlink():
                     try:
                         relative = path.resolve().relative_to(worktree.resolve())
@@ -239,12 +330,25 @@ class GeminiClosedLoopOrchestrator:
                 paths.add(path.name)
         return sorted(paths)
 
+    @staticmethod
+    def _detect_modified_or_new_tests(files: list[str]) -> list[str]:
+        tests = []
+        for f in files:
+            p = Path(f)
+            name = p.name
+            normalized = f.replace("\\", "/")
+            if name.startswith("test_") or name.endswith("_test.py") or "tests/" in normalized:
+                tests.append(f)
+        return sorted(set(tests))
+
     async def run(
         self,
         requirement: str,
         title: Optional[str] = None,
         mock_mode: bool = False,
         custom_test_cmd: Optional[str] = None,
+        test_paths: Optional[list[str]] = None,
+        allow_untrusted_tests: bool = False,
         dev_agent: Optional[GeminiDevAgent] = None,
         reviewer_agent: Optional[FlashReviewer] = None,
         task_id: Optional[str] = None,
@@ -252,6 +356,8 @@ class GeminiClosedLoopOrchestrator:
 
         if custom_test_cmd:
             validate_custom_test_cmd(custom_test_cmd)
+        if test_paths:
+            validate_safe_test_paths(test_paths)
 
         if not requirement or not requirement.strip():
             raise ValueError("Task requirement must not be empty")
@@ -264,7 +370,7 @@ class GeminiClosedLoopOrchestrator:
         task_id = task_id or f"task_gemini_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         title = title or requirement[:40]
 
-        # Initialize Task record with mock_mode isolation
+        # Initialize Task record with mock_mode isolation and repo_root
         with self._provide_session(mock_mode) as s:
             s.add(
                 Task(
@@ -275,6 +381,7 @@ class GeminiClosedLoopOrchestrator:
                     branch_name=f"gemini/{task_id}",
                     state="INIT",
                     mock_mode=mock_mode,
+                    repo_root=str(self.repo_root),
                 )
             )
             s.commit()
@@ -337,6 +444,14 @@ class GeminiClosedLoopOrchestrator:
                 self._log_step(task_id, "Gate: Native Write Tool Verification", "SYSTEM", "Gate", "FAILED", error_snippet=error_msg, mock_mode=mock_mode)
                 return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=0)
 
+            # Security Check: Reject any sensitive files
+            has_sens, sens_path = contains_sensitive_files(files_written)
+            if has_sens:
+                error_msg = f"Security violation: generated changes touch sensitive path: {sens_path}"
+                self._save_task_state(task_id, "FAILED", 0, error_msg, mock_mode=mock_mode)
+                self._log_step(task_id, "Gate: Sensitive Path Verification", "SECURITY", "Gate", "FAILED", error_snippet=error_msg, mock_mode=mock_mode)
+                return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=0)
+
             # Commit initial development checkpoint
             checkpoint_sha = await self.worktree_mgr.commit_checkpoint(worktree, "feat: gemini initial development")
             diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
@@ -350,15 +465,39 @@ class GeminiClosedLoopOrchestrator:
 
             self._log_step(task_id, "Commit Gemini Implementation", "SYSTEM", "Git", "SUCCESS", output_snippet=checkpoint_sha, mock_mode=mock_mode)
 
+            # Check untrusted test files
+            untrusted_tests = self._detect_modified_or_new_tests(files_written)
+            if untrusted_tests and not allow_untrusted_tests and not mock_mode:
+                wait_msg = (
+                    f"Untrusted test code generated or modified without OS sandbox isolation: {untrusted_tests}. "
+                    "Paused for human approval before execution."
+                )
+                self._save_task_state(task_id, "WAITING_APPROVAL", 0, wait_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha)
+                self._log_step(task_id, "Sandbox Gate: Untrusted Test Code", "SECURITY", "Gate", "WAITING_APPROVAL", output_snippet=wait_msg, mock_mode=mock_mode)
+                return ClosedLoopResult(
+                    task_id=task_id,
+                    success=False,
+                    state="WAITING_APPROVAL",
+                    result_summary=wait_msg,
+                    repair_attempts=0,
+                    final_commit_sha=checkpoint_sha,
+                )
+
+            # Capture HEAD and tree hash before running tests
+            head_before = await self.worktree_mgr.get_head_sha(worktree)
+            tree_before = await self.worktree_mgr.get_tree_hash(worktree, checkpoint_sha)
+
             # Run test verification
-            test_paths = self._test_paths(worktree, files_written)
-            runner = TestRunner(worktree, custom_test_cmd=custom_test_cmd, test_paths=test_paths or None)
+            chosen_tests = validate_safe_test_paths(test_paths, worktree) if test_paths else self._test_paths(worktree, files_written)
+            runner = TestRunner(worktree, test_paths=chosen_tests or None)
             test_res = await runner.run(timeout=self.policy.execution.timeout_seconds)
 
-            # Gate 3: Verify clean working directory after test execution
+            # Gate 3: Verify clean working directory, unchanged HEAD and tree hash after test
             is_clean = await self.worktree_mgr.is_clean(worktree)
-            if not is_clean:
-                error_msg = "Working directory state modified during test execution (uncommitted changes detected)"
+            head_after = await self.worktree_mgr.get_head_sha(worktree)
+            tree_after = await self.worktree_mgr.get_tree_hash(worktree, "HEAD")
+            if not is_clean or head_after != head_before or tree_after != tree_before:
+                error_msg = "Working directory state modified during test execution (uncommitted changes or rogue commit detected)"
                 self._save_task_state(task_id, "FAILED", 0, error_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha, test_passed=test_res.passed)
                 return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=0)
 
@@ -372,7 +511,7 @@ class GeminiClosedLoopOrchestrator:
                 mock_mode=mock_mode,
             )
 
-            diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
+            diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref, target_ref=checkpoint_sha)
             latest_artifacts = DevelopmentArtifacts(
                 task_id=task_id,
                 commit_sha=checkpoint_sha,
@@ -382,6 +521,8 @@ class GeminiClosedLoopOrchestrator:
                 test_summary=test_res.raw_output,
                 generated_files=files_written,
                 repair_attempts=repair_attempts,
+                tree_hash=tree_before,
+                evidence_id=str(uuid.uuid4())[:8],
             )
 
             # -----------------------------------------------------------------
@@ -444,6 +585,7 @@ class GeminiClosedLoopOrchestrator:
                         )
 
                     raw_verdict = review_res.metadata.get("review") or {}
+                    server_model = review_res.metadata.get("server_model") or reviewer.model_name
                     latest_verdict = ReviewVerdict(
                         approved=bool(raw_verdict.get("approved")),
                         severity=raw_verdict.get("severity", "P2"),
@@ -451,6 +593,7 @@ class GeminiClosedLoopOrchestrator:
                         critical_issues=raw_verdict.get("critical_issues", []),
                         suggestions=raw_verdict.get("suggestions", []),
                         reviewer_model=reviewer.model_name,
+                        server_model=server_model,
                     )
 
                     self._log_step(
@@ -535,7 +678,7 @@ class GeminiClosedLoopOrchestrator:
                         f"Repair limit exhausted ({repair_attempts}/{self.max_repair_attempts}). "
                         f"Last rejection: {rejection_reason[:200]}"
                     )
-                    self._save_task_state(task_id, "FAILED", repair_attempts, exhausted_summary)
+                    self._save_task_state(task_id, "FAILED", repair_attempts, exhausted_summary, mock_mode=mock_mode)
                     return ClosedLoopResult(
                         task_id=task_id,
                         success=False,
@@ -550,7 +693,7 @@ class GeminiClosedLoopOrchestrator:
 
                 # Proceed with repair
                 repair_attempts += 1
-                self._save_task_state(task_id, "REPAIRING", repair_attempts=repair_attempts)
+                self._save_task_state(task_id, "REPAIRING", repair_attempts=repair_attempts, mock_mode=mock_mode)
                 self._log_step(
                     task_id,
                     f"Gemini Repair Attempt #{repair_attempts}",
@@ -558,6 +701,7 @@ class GeminiClosedLoopOrchestrator:
                     dev.model_name,
                     "IN_PROGRESS",
                     output_snippet=rejection_reason[:300],
+                    mock_mode=mock_mode,
                 )
 
                 repair_prompt = (
@@ -570,7 +714,7 @@ class GeminiClosedLoopOrchestrator:
 
                 if not repair_res.success:
                     error_msg = f"Gemini repair attempt #{repair_attempts} failed: {repair_res.error}"
-                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg)
+                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
                     return ClosedLoopResult(
                         task_id=task_id,
                         success=False,
@@ -582,20 +726,32 @@ class GeminiClosedLoopOrchestrator:
                         history=history,
                     )
 
+                repair_files = repair_res.metadata.get("files_written", [])
+                has_sens, sens_path = contains_sensitive_files(repair_files)
+                if has_sens:
+                    error_msg = f"Security violation in repair #{repair_attempts}: touched sensitive path: {sens_path}"
+                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
+
                 checkpoint_sha = await self.worktree_mgr.commit_checkpoint(
                     worktree, f"fix: gemini repair attempt #{repair_attempts}"
                 )
-                repair_paths = self._test_paths(worktree, repair_res.metadata.get("files_written", [])) or test_paths
-                runner = TestRunner(worktree, custom_test_cmd=custom_test_cmd, test_paths=repair_paths or None)
+                head_before = await self.worktree_mgr.get_head_sha(worktree)
+                tree_before = await self.worktree_mgr.get_tree_hash(worktree, checkpoint_sha)
+
+                repair_paths = self._test_paths(worktree, repair_files) or (validate_safe_test_paths(test_paths, worktree) if test_paths else None)
+                runner = TestRunner(worktree, test_paths=repair_paths or None)
                 test_res = await runner.run(timeout=self.policy.execution.timeout_seconds)
 
                 is_clean = await self.worktree_mgr.is_clean(worktree)
-                if not is_clean:
+                head_after = await self.worktree_mgr.get_head_sha(worktree)
+                tree_after = await self.worktree_mgr.get_tree_hash(worktree, "HEAD")
+                if not is_clean or head_after != head_before or tree_after != tree_before:
                     error_msg = f"Working directory state modified during test execution in repair attempt #{repair_attempts}"
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha, test_passed=test_res.passed)
                     return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
-                diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
+                diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref, target_ref=checkpoint_sha)
                 if not checkpoint_sha or checkpoint_sha == base_ref or not diff.strip():
                     error_msg = f"Gemini repair attempt #{repair_attempts} produced no committed changes (empty diff or unchanged SHA)"
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha)
@@ -608,8 +764,10 @@ class GeminiClosedLoopOrchestrator:
                     git_diff=diff,
                     test_passed=test_res.passed,
                     test_summary=test_res.raw_output,
-                    generated_files=repair_res.metadata.get("files_written", []),
+                    generated_files=repair_files,
                     repair_attempts=repair_attempts,
+                    tree_hash=tree_before,
+                    evidence_id=str(uuid.uuid4())[:8],
                 )
 
         except BudgetLimitError as err:
@@ -643,6 +801,8 @@ class GeminiClosedLoopOrchestrator:
         notes: Optional[str] = None,
         mock_mode: bool = False,
         custom_test_cmd: Optional[str] = None,
+        test_paths: Optional[list[str]] = None,
+        allow_untrusted_tests: bool = True,
         dev_agent: Optional[GeminiDevAgent] = None,
         reviewer_agent: Optional[FlashReviewer] = None,
     ) -> ClosedLoopResult:
@@ -651,7 +811,11 @@ class GeminiClosedLoopOrchestrator:
         Maintains the original Gemini developer and independent reviewer context,
         retaining bounded repairs and gate verifications.
         """
-        validate_custom_test_cmd(custom_test_cmd)
+        if custom_test_cmd:
+            validate_custom_test_cmd(custom_test_cmd)
+        if test_paths:
+            validate_safe_test_paths(test_paths)
+
         with self._provide_session(mock_mode) as s:
             task = s.exec(select(Task).where(Task.task_id == task_id)).first()
             if not task:
@@ -662,6 +826,15 @@ class GeminiClosedLoopOrchestrator:
             current_repair_attempts = task.repair_attempts
             stored_worktree = task.worktree_path
             reviewer_model_str = task.reviewer_model
+            stored_repo_root = task.repo_root
+            pre_p0_checkpoint = task.commit_sha
+
+        # Validate task repository root
+        if stored_repo_root:
+            stored_path = Path(stored_repo_root).resolve()
+            if stored_path != self.repo_root:
+                if not (stored_path / ".git").exists():
+                    raise ValueError(f"Task stored repo root is invalid: {stored_repo_root}")
 
         if not approved:
             decision_note = notes or "Rejected by human operator"
@@ -702,6 +875,9 @@ class GeminiClosedLoopOrchestrator:
             worktree = (await self.worktree_mgr.create_worktree(task_id)).resolve()
             self._save_task_state(task_id, "REPAIRING", current_repair_attempts, mock_mode=mock_mode, worktree_path=str(worktree))
 
+        if not (worktree / ".git").exists():
+            raise ValueError(f"Worktree has no git repository metadata: {worktree}")
+
         base_ref = await self.worktree_mgr.get_base_ref(worktree)
         dev = dev_agent or GeminiDevAgent(mock_mode=mock_mode)
         rev_choice = "deepseek" if reviewer_model_str and "deepseek" in reviewer_model_str.lower() else self.reviewer_choice
@@ -741,22 +917,49 @@ class GeminiClosedLoopOrchestrator:
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
                     return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
+                repair_files = repair_res.metadata.get("files_written", [])
+                native_tools = repair_res.metadata.get("native_tool_steps", [])
+                has_write = any(
+                    item.get("name") in ("write_to_file", "replace_file_content") and item.get("succeeded")
+                    for item in native_tools
+                ) or bool(repair_files)
+                if not mock_mode and not has_write:
+                    error_msg = f"Gemini approved repair #{repair_attempts} produced no native file modifications"
+                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
+
+                has_sens, sens_path = contains_sensitive_files(repair_files)
+                if has_sens:
+                    error_msg = f"Security violation in repair #{repair_attempts}: touched sensitive path: {sens_path}"
+                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
+
                 checkpoint_sha = await self.worktree_mgr.commit_checkpoint(
                     worktree, f"fix: gemini approved repair attempt #{repair_attempts}"
                 )
-                test_paths = self._test_paths(worktree, repair_res.metadata.get("files_written", []))
-                runner = TestRunner(worktree, custom_test_cmd=custom_test_cmd, test_paths=test_paths or None)
+                if not checkpoint_sha or checkpoint_sha == pre_p0_checkpoint:
+                    error_msg = f"Gemini approved repair #{repair_attempts} produced no new commit or unchanged SHA after approval"
+                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha)
+                    return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
+
+                head_before = await self.worktree_mgr.get_head_sha(worktree)
+                tree_before = await self.worktree_mgr.get_tree_hash(worktree, checkpoint_sha)
+
+                repair_paths = self._test_paths(worktree, repair_files) or (validate_safe_test_paths(test_paths, worktree) if test_paths else None)
+                runner = TestRunner(worktree, test_paths=repair_paths or None)
                 test_res = await runner.run(timeout=self.policy.execution.timeout_seconds)
 
                 is_clean = await self.worktree_mgr.is_clean(worktree)
-                if not is_clean:
+                head_after = await self.worktree_mgr.get_head_sha(worktree)
+                tree_after = await self.worktree_mgr.get_tree_hash(worktree, "HEAD")
+                if not is_clean or head_after != head_before or tree_after != tree_before:
                     error_msg = f"Working directory modified during test execution in repair #{repair_attempts}"
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha, test_passed=test_res.passed)
                     return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
-                diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
-                if not checkpoint_sha or checkpoint_sha == base_ref or not diff.strip():
-                    error_msg = f"Gemini approved repair #{repair_attempts} produced no committed changes (empty diff or unchanged SHA)"
+                diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref, target_ref=checkpoint_sha)
+                if not diff.strip():
+                    error_msg = f"Gemini approved repair #{repair_attempts} produced empty diff relative to base"
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha)
                     return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
@@ -767,8 +970,10 @@ class GeminiClosedLoopOrchestrator:
                     git_diff=diff,
                     test_passed=test_res.passed,
                     test_summary=test_res.raw_output,
-                    generated_files=repair_res.metadata.get("files_written", []),
+                    generated_files=repair_files,
                     repair_attempts=repair_attempts,
+                    tree_hash=tree_before,
+                    evidence_id=str(uuid.uuid4())[:8],
                 )
 
                 if not latest_artifacts.test_passed:
@@ -779,8 +984,8 @@ class GeminiClosedLoopOrchestrator:
                     review_context = {
                         "requirement": requirement,
                         "expected_commit_sha": latest_artifacts.commit_sha,
-                        "git_diff": redact_and_truncate_evidence(latest_artifacts.git_diff),
-                        "test_summary": redact_and_truncate_evidence(latest_artifacts.test_summary),
+                        "git_diff": redact_and_truncate_evidence(latest_artifacts.git_diff, max_chars=40000),
+                        "test_summary": redact_and_truncate_evidence(latest_artifacts.test_summary, max_chars=80000),
                         "worktree_path": str(worktree),
                     }
 
@@ -805,6 +1010,7 @@ class GeminiClosedLoopOrchestrator:
                         return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
                     raw_verdict = review_res.metadata.get("review") or {}
+                    server_model = review_res.metadata.get("server_model") or reviewer.model_name
                     latest_verdict = ReviewVerdict(
                         approved=bool(raw_verdict.get("approved")),
                         severity=raw_verdict.get("severity", "P2"),
@@ -812,6 +1018,7 @@ class GeminiClosedLoopOrchestrator:
                         critical_issues=raw_verdict.get("critical_issues", []),
                         suggestions=raw_verdict.get("suggestions", []),
                         reviewer_model=reviewer.model_name,
+                        server_model=server_model,
                     )
 
                     self._log_step(

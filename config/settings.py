@@ -116,6 +116,9 @@ class AppSettings(BaseSettings):
     sqlite_db_path: str = Field(
         default_factory=lambda: os.getenv("AGENT_COOPERATION_DB_PATH") or str(PROJECT_ROOT / "data" / "agent_orchestrator.db")
     )
+    mock_sqlite_db_path: str = Field(
+        default_factory=lambda: os.getenv("AGENT_COOPERATION_MOCK_DB_PATH") or str(PROJECT_ROOT / "data" / "mock_agent_orchestrator.db")
+    )
     policy_yaml_path: str = Field(
         default_factory=lambda: os.getenv("AGENT_COOPERATION_POLICY_PATH") or str(PROJECT_ROOT / "config" / "policy.yaml")
     )

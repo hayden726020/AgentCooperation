@@ -37,6 +37,8 @@ def init_db(target_engine=None):
                 ("mock_mode", "BOOLEAN DEFAULT 0"),
                 ("reviewer_model", "TEXT"),
                 ("test_passed", "BOOLEAN"),
+                ("repo_root", "TEXT"),
+                ("base_ref", "TEXT"),
             ]
             for col_name, col_def in new_cols:
                 if col_name not in existing_cols:
