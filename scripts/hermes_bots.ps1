@@ -55,18 +55,16 @@ if ($Bot -eq 'coop-dev') {
     if ($rawConfig -notmatch 'antigravity-cli') {
         throw "coop-dev Antigravity CLI channel is not configured. Run configure_hermes_bots.py first."
     }
-    # Resolve YAML semantically, so comments or the string "true" cannot enable it.
-    $bridgeEnabled = & $Python -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1],encoding="utf-8")) or {}; print("enabled" if c.get("antigravity_cli",{}).get("experimental_subscription_bridge") is True else "disabled")' $configPath
+    # Resolve YAML semantically via helper, avoiding inline quote stripping in PowerShell 5.1.
+    $profileInfoJson = & $Python (Join-Path $PSScriptRoot 'profile_info.py') $configPath
     if ($LASTEXITCODE -ne 0) { throw "Could not read Gemini bridge configuration." }
-    if ($bridgeEnabled -ne 'enabled') {
+    $profileInfo = $profileInfoJson | ConvertFrom-Json
+    if (-not $profileInfo.bridge_enabled) {
         throw "Hermes model-provider chat remains blocked. Enable the experimental bridge in the managed profile, or use ./scripts/hermes_bots.ps1 direct coop-dev."
     }
     Write-Host "Starting experimental Hermes Gemini High conversation bridge via the native subscription CLI."
-    $projectInfo = & $Python -c 'import json,sys,yaml; c=yaml.safe_load(open(sys.argv[1],encoding="utf-8")) or {}; p=c.get("antigravity_cli",{}).get("project_execution",{}); print(json.dumps({"enabled": p.get("enabled") is True, "workspace": p.get("workspace")}))' $configPath
-    if ($LASTEXITCODE -ne 0) { throw "Could not read Gemini project execution configuration." }
-    $projectState = $projectInfo | ConvertFrom-Json
-    if ($projectState.enabled) {
-        Write-Host "Bounded project execution is enabled for: $($projectState.workspace)"
+    if ($profileInfo.project_enabled) {
+        Write-Host "Bounded project execution is enabled for: $($profileInfo.workspace)"
         Write-Host "Native tools may read and edit that workspace and run the limited local test allowlist. Gemini API fallback remains disabled."
     } else {
         Write-Host "Project execution is disabled; this session is text-only. Gemini API fallback remains disabled."
