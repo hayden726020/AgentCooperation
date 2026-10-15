@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Convenient wrapper for AgentCooperation CLI (`hermes coop`).
