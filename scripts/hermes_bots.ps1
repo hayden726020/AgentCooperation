@@ -1,4 +1,4 @@
-#requires -Version 7.3
+#requires -Version 5.1
 param(
     [ValidateSet('list', 'show', 'chat', 'direct')]
     [string] $Action = 'list',
