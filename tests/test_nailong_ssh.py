@@ -60,8 +60,13 @@ def test_dry_run_uses_safe_defaults_and_two_distinct_ssh_phases(powershell):
     payload = json.loads(result.stdout)
     assert payload["destination"] == "spcuteag@server.example"
     assert payload["port"] == 22
-    assert payload["probe_arguments"][-2:] == ["spcuteag@server.example", "sh -s"]
+    assert payload["probe_arguments"][-2:] == [
+        "spcuteag@server.example",
+        "timeout 8 sh -s",
+    ]
     assert payload["interactive_arguments"][-1] == "spcuteag@server.example"
+    assert "ServerAliveInterval=5" in payload["probe_arguments"]
+    assert "ServerAliveCountMax=2" in payload["probe_arguments"]
     assert "StrictHostKeyChecking=no" not in result.stdout
 
 
@@ -94,7 +99,7 @@ $esc = [char]27
 $lines = @(
     'Ubuntu banner noise',
     '__NAILONG_BEGIN__',
-    ('HOSTNAME=' + $esc + '[31mmilk-host' + $esc + '[0m'),
+    ('HOSTNAME=' + $esc + '[31mmilk-' + [char]0x202e + 'host' + $esc + '[0m'),
     'OS=Ubuntu 24.04.1 LTS',
     'UPTIME=2 days, 3 hours',
     'LOAD=0.10 0.20 0.30',
@@ -148,6 +153,24 @@ $facts = [pscustomobject]@{{
     assert "奶龙已上线，开始工作" in payload["wideView"]
     assert "192.168.1.8" in payload["miniView"]
     assert "\x1b[" not in payload["wideView"] + payload["miniView"]
+
+
+def test_ultra_narrow_view_never_exceeds_terminal_column_width(powershell):
+    body = f"""
+. {ps_literal(SCRIPT)}
+$facts = [pscustomobject]@{{
+    Hostname='milk-host'; OS='Ubuntu 24.04 LTS'; Uptime='3 hours';
+    Load='0.10 0.20 0.30'; Memory='512/2048 MiB (25%)';
+    Disk='1024/4096 MiB (25%)'; IP='192.168.1.8'
+}}
+$view = Get-NailongStaticView -Facts $facts -Width 16 -UseColor:$false
+@($view -split "`r?`n" | ForEach-Object {{ Get-NailongDisplayWidth -Text $_ }}) |
+    ConvertTo-Json
+"""
+    result = run_ps(powershell, body)
+    assert result.returncode == 0, result.stderr
+    widths = json.loads(result.stdout)
+    assert max(widths) <= 16
 
 
 def test_color_detection_honors_explicit_and_environment_fallbacks(powershell):
@@ -212,6 +235,50 @@ Get-NailongRemoteProbeScript
     assert "hostname -I" in probe
     assert all(token not in probe.lower() for token in ("curl ", "wget ", "http://", "https://"))
     assert all(token not in probe.lower() for token in ("sudo ", "apt ", "rm ", "tee "))
+    assert ". /etc/os-release" not in probe
+
+
+def test_nonzero_native_probe_is_returned_even_with_strict_pwsh_native_errors(powershell):
+    body = f"""
+. {ps_literal(SCRIPT)}
+$oldPreference = $ErrorActionPreference
+$hadNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+if ($hadNativePreference) {{ $oldNativePreference = $PSNativeCommandUseErrorActionPreference }}
+try {{
+    $ErrorActionPreference = 'Stop'
+    $global:PSNativeCommandUseErrorActionPreference = $true
+    $result = Invoke-NailongProbe -SshExecutable $env:ComSpec -Arguments @('/d', '/c', 'exit 7')
+    $result.ExitCode
+}} finally {{
+    $ErrorActionPreference = $oldPreference
+    if ($hadNativePreference) {{
+        $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+    }} else {{
+        Remove-Variable PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue
+    }}
+}}
+"""
+    result = run_ps(powershell, body)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "7"
+
+
+def test_interactive_native_output_is_not_replaced_by_a_numeric_return_value(powershell):
+    body = f"""
+. {ps_literal(SCRIPT)}
+Invoke-NailongInteractiveSession -SshExecutable $env:ComSpec `
+    -Arguments @('/d', '/c', 'echo REMOTE_OUTPUT & exit 7')
+[Console]::WriteLine(('EXIT=' + $script:NailongInteractiveExitCode))
+"""
+    result = run_ps(powershell, body)
+    assert result.returncode == 0, result.stderr
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    assert lines == ["REMOTE_OUTPUT", "EXIT=7"]
+
+
+def test_script_entrypoint_does_not_capture_the_interactive_invocation():
+    source = SCRIPT.read_text(encoding="utf-8-sig")
+    assert "$result = Invoke-NailongSsh" not in source
 
 
 def test_installer_is_idempotent_and_uninstall_preserves_existing_profile(powershell, tmp_path):

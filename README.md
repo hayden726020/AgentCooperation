@@ -51,6 +51,7 @@ python -m orchestrator.cli web --port 5000 --mock
 | 入口 | 用途 |
 | --- | --- |
 | [当前上下文](docs/CONTEXT.md) | 角色配置、源码地图、待办和验收边界 |
+| [奶龙 SSH 登录动画](docs/NAILONG_SSH.md) | Windows 客户端动画、安装和安全边界 |
 | [Hermes Bot 使用](docs/HERMES_BOTS.md) | 手动 Profiles 和运维说明；与自动流水线区分 |
 | [历史文档](docs/archive/README.md) | 历史验收、选型、修复记录和整理前完整 README |
 | [参考项目](references/README.md) | 已登记的 Git 子模块 |
