@@ -55,7 +55,17 @@ execution:
   git_worktree_base: ".worktrees"
   max_output_tokens: 8192
   max_context_tokens: 200000
+  # Repo-scoped argv allowlist. Keys are POSIX paths relative to the project
+  # root; "default" applies when no repo-specific entry matches. Arguments stay
+  # inside the task worktree and shell composition is always rejected.
+  allowed_commands:
+    default:
+      test:
+        - ["python", "-m", "pytest"]
+      build: []
+      typecheck: []
 
 security:
   allowed_repos:
     - "."
+    - "workplace/NAILONG"

@@ -315,3 +315,104 @@ async def test_fallback_audit_binds_final_commit_and_validation(harness):
     assert audit.commit_sha == "f" * 40
     assert evidence.test_summary == "1 passed"
     assert '"approved": true' in audit.gemini_review_json
+
+
+def test_project_context_injects_architecture_map(tmp_path):
+    arch_dir = tmp_path / ".planning" / "codebase"
+    arch_dir.mkdir(parents=True)
+    (arch_dir / "architecture.md").write_text("system_architecture_blueprint", encoding="utf-8")
+    (tmp_path / "main.py").write_text("main_code = 1", encoding="utf-8")
+    context = core_module.OrchestratorCore._project_context(tmp_path)
+    assert "system_architecture_blueprint" in context
+    assert "main_code" in context
+
+
+def test_project_context_balances_modules_and_honors_target_modules(tmp_path):
+    mod_a = tmp_path / "mod_a"
+    mod_b = tmp_path / "mod_b"
+    mod_a.mkdir()
+    mod_b.mkdir()
+    (mod_a / "a1.py").write_text("code_a1", encoding="utf-8")
+    (mod_a / "a2.py").write_text("code_a2", encoding="utf-8")
+    (mod_b / "b1.py").write_text("code_b1", encoding="utf-8")
+
+    # Target module priority
+    target_context = core_module.OrchestratorCore._project_context(tmp_path, target_modules=["mod_b"])
+    pos_b = target_context.find("code_b1")
+    pos_a = target_context.find("code_a1")
+    assert pos_b != -1 and pos_a != -1
+    assert pos_b < pos_a
+
+    # Interleaved round-robin balancing
+    balanced_context = core_module.OrchestratorCore._project_context(tmp_path)
+    pos_a1 = balanced_context.find("code_a1")
+    pos_b1 = balanced_context.find("code_b1")
+    pos_a2 = balanced_context.find("code_a2")
+    # b1 appears before a2 due to round-robin directory interleaving
+    assert pos_a1 < pos_b1 < pos_a2
+
+
+@pytest.mark.asyncio
+async def test_call_primary_blocks_sensitive_files(harness, tmp_path):
+    task_id = "task_sens_test"
+    with harness.session:
+        harness.session.add(
+            core_module.Task(
+                task_id=task_id,
+                title="sensitive test",
+                requirement="req",
+                primary_model="fake-flash",
+                branch_name=f"codex/{task_id}",
+                state="INIT",
+            )
+        )
+        harness.session.commit()
+
+    mock_agent = AsyncMock()
+    mock_agent.model_name = "MockAgent"
+    mock_agent.estimate_max_cost = lambda *args, **kwargs: 0.01
+    mock_agent.execute.return_value = core_module.AgentResult(
+        success=True,
+        content="Wrote secrets",
+        metadata={"files_written": [".env"], "mock": True},
+    )
+
+    with pytest.raises(ValueError, match="sensitive protected path: .env"):
+        await harness.core._call_primary(
+            task_id=task_id,
+            agent=mock_agent,
+            step="Development",
+            prompt="Write .env file",
+            worktree=tmp_path,
+            mock_mode=True,
+        )
+
+
+def test_handle_execution_exception_includes_probe_summary(harness):
+    task_id = "task_probe_test"
+    with harness.session:
+        harness.session.add(
+            core_module.Task(
+                task_id=task_id,
+                title="probe",
+                requirement="req",
+                primary_model="fake-flash",
+                branch_name=f"codex/{task_id}",
+                state="INIT",
+            )
+        )
+        harness.session.commit()
+
+    fsm = core_module.TaskLifecycleFSM()
+    error = RuntimeError("Execution connection timed out")
+    probe_summary = "Task produced 1 commit(s) ahead of base (abc12345); working tree clean."
+
+    task = harness.core._handle_execution_exception(
+        task_id=task_id,
+        fsm=fsm,
+        error=error,
+        probe_summary=probe_summary,
+    )
+    assert task.state == "FAILED"
+    assert "Execution connection timed out" in task.result_summary
+    assert "Worktree probe: Task produced 1 commit(s)" in task.result_summary

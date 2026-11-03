@@ -259,3 +259,160 @@ async def test_unittest_expected_failures_are_not_successful_tests(tmp_path, mon
     monkeypatch.setattr("execution.test_runner.run_async_command", AsyncMock(return_value=result(stdout="Ran 1 test in 0.001s\nOK (expected failures=1)")))
     outcome = await Runner(tmp_path, custom_test_argv=[sys.executable, "-m", "unittest"]).run()
     assert not outcome.passed
+
+
+@pytest.mark.asyncio
+async def test_streaming_callback_receives_lines_and_preserves_output():
+    received = []
+    code = "import sys;print('out-1');print('err-1', file=sys.stderr);print('out-2')"
+    outcome = await run_async_command(
+        [sys.executable, "-c", code],
+        on_line=lambda line, stream: received.append((stream, line)),
+    )
+
+    assert outcome.is_success
+    assert outcome.stdout.splitlines() == ["out-1", "out-2"]
+    assert outcome.stderr.splitlines() == ["err-1"]
+    assert ("stdout", "out-1") in received
+    assert ("stdout", "out-2") in received
+    assert ("stderr", "err-1") in received
+
+
+@pytest.mark.asyncio
+async def test_streaming_callback_supports_async_callbacks():
+    received = []
+
+    async def callback(line, stream):
+        received.append((stream, line))
+
+    outcome = await run_async_command(
+        [sys.executable, "-c", "print('async-line')"],
+        on_line=callback,
+    )
+
+    assert outcome.is_success
+    assert ("stdout", "async-line") in received
+
+
+@pytest.mark.asyncio
+async def test_streaming_callback_receives_ansi_cleaned_lines():
+    received = []
+    outcome = await run_async_command(
+        [sys.executable, "-c", "print('\\033[31mred\\033[0m')"],
+        on_line=lambda line, stream: received.append(line),
+    )
+
+    assert outcome.stdout.strip() == "red"
+    assert received == ["red"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_callback_failure_does_not_break_command():
+    def callback(line, stream):
+        raise RuntimeError("callback boom")
+
+    outcome = await run_async_command(
+        [sys.executable, "-c", "print('ok')"],
+        on_line=callback,
+    )
+
+    assert outcome.is_success
+    assert outcome.stdout.splitlines() == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_timeout_returns_partial_output():
+    received = []
+    code = "import time;print('before-timeout', flush=True);time.sleep(30)"
+    outcome = await run_async_command(
+        [sys.executable, "-c", code],
+        timeout=0.3,
+        on_line=lambda line, stream: received.append(line),
+    )
+
+    assert outcome.timed_out
+    assert not outcome.is_success
+    assert "before-timeout" in outcome.stdout
+    assert "before-timeout" in received
+
+
+@pytest.mark.asyncio
+async def test_streaming_supports_stdin_input():
+    outcome = await run_async_command(
+        [sys.executable, "-c", "import sys;print(sys.stdin.read().strip().upper())"],
+        input_text="hello\n",
+        on_line=lambda line, stream: None,
+    )
+
+    assert outcome.is_success
+    assert outcome.stdout.splitlines() == ["HELLO"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [100000, 5 * 1024 * 1024 + 100])
+async def test_streaming_handles_lines_larger_than_the_stream_limit(size):
+    received = []
+    outcome = await run_async_command(
+        [sys.executable, "-c", f"print('x' * {size})"],
+        on_line=lambda line, stream: received.append(len(line)),
+    )
+
+    assert outcome.is_success
+    assert outcome.stdout.count("x") == size
+    assert sum(received) == size
+
+
+@pytest.mark.asyncio
+async def test_streaming_stdin_write_is_bounded_by_timeout():
+    outcome = await asyncio.wait_for(
+        run_async_command(
+            [sys.executable, "-c", "import time;time.sleep(30)"],
+            timeout=0.3,
+            input_text="x" * (4 * 1024 * 1024),
+            on_line=lambda line, stream: None,
+        ),
+        timeout=10,
+    )
+
+    assert outcome.timed_out
+    assert not outcome.is_success
+
+
+@pytest.mark.asyncio
+async def test_streaming_cleanup_failure_is_reported(monkeypatch):
+    def failing_kill(pid):
+        raise RuntimeError("denied")
+
+    monkeypatch.setattr("execution.subproc.kill_process_tree", failing_kill)
+    with pytest.raises(RuntimeError):
+        await run_async_command(
+            [sys.executable, "-c", "import time;time.sleep(30)"],
+            timeout=0.05,
+            on_line=lambda line, stream: None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_streaming_cancellation_reaps_process(tmp_path):
+    import psutil
+
+    pid_path = tmp_path / "streaming_child.pid"
+    code = "import os,pathlib,time;pathlib.Path(os.environ['PID_PATH']).write_text(str(os.getpid()));time.sleep(30)"
+    task = asyncio.create_task(
+        run_async_command(
+            [sys.executable, "-c", code],
+            env={"PID_PATH": str(pid_path)},
+            on_line=lambda line, stream: None,
+        )
+    )
+
+    async def wait_for_pid():
+        while not pid_path.exists():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_pid(), timeout=5)
+    pid = int(pid_path.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert not psutil.pid_exists(pid)

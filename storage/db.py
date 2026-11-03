@@ -29,13 +29,18 @@ def init_db(target_engine=None):
     use_engine = target_engine or engine
     SQLModel.metadata.create_all(use_engine)
     with use_engine.connect() as conn:
+        # Serialize schema discovery and ALTER TABLE across independent workers.
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
         try:
             res = conn.exec_driver_sql("PRAGMA table_info(tasks)").fetchall()
             existing_cols = {row[1] for row in res}
             new_cols = [
+                ("approval_claim_id", "TEXT"),
                 ("commit_sha", "TEXT"),
                 ("mock_mode", "BOOLEAN DEFAULT 0"),
                 ("reviewer_model", "TEXT"),
+                ("max_repair_attempts", "INTEGER"),
+                ("test_paths", "TEXT"),
                 ("test_passed", "BOOLEAN"),
                 ("repo_root", "TEXT"),
                 ("base_ref", "TEXT"),
@@ -45,7 +50,8 @@ def init_db(target_engine=None):
                     conn.exec_driver_sql(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_def}")
             conn.commit()
         except Exception:
-            pass
+            conn.rollback()
+            raise
 
 
 def get_session(target_engine=None) -> Session:

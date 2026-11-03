@@ -16,6 +16,7 @@ from agents.codex_expert import CodexExpert, CodexQuotaExhaustedError
 from agents.gemini_reviewer import GeminiReviewer
 from agents.codex_reviewer import CodexReviewer
 from config.settings import settings
+from execution.security import contains_sensitive_files, redact_and_truncate_evidence
 from execution.test_runner import TestRunner
 from execution.worktree import WorktreeManager
 from orchestrator.budget_guard import BudgetGuard, BudgetLimitError
@@ -96,23 +97,51 @@ class OrchestratorCore:
             session.expunge(task)
             return task
 
+    def _handle_execution_exception(
+        self,
+        task_id: str,
+        fsm: TaskLifecycleFSM,
+        error: BaseException,
+        probe_summary: Optional[str] = None,
+    ) -> Optional[Task]:
+        if isinstance(error, BudgetLimitError):
+            fsm.to_budget_stopped()
+            self._log_step(task_id, "Budget Stop", "SYSTEM", "Orchestrator", error=str(error))
+            return self._finish(task_id, fsm, str(error))
+        if isinstance(error, asyncio.CancelledError):
+            fsm.to_interrupted()
+            self._finish(task_id, fsm, "Execution interrupted; automatic delivery withheld")
+            raise
+        fsm.to_failed()
+        err_msg = f"Execution failed: {error}"
+        if probe_summary:
+            err_msg = f"{err_msg} | Worktree probe: {probe_summary}"
+        self._log_step(task_id, "Fatal Exception", "SYSTEM", "Orchestrator", error=err_msg)
+        return self._finish(task_id, fsm, err_msg)
+
     @staticmethod
-    def _project_context(root: Path, limit=24000):
-        """Prioritize current briefs and source within a fixed character budget."""
+    def _project_context(root: Path, limit=24000, target_modules: Optional[list[str]] = None):
+        """Prioritize current briefs, architecture maps and balanced source within a fixed character budget."""
         root = root.resolve(strict=True)
+
         def safe_path(path):
             try:
                 resolved = path.resolve(strict=True)
                 return resolved.is_relative_to(root) and resolved == path.absolute()
             except (OSError, RuntimeError):
                 return False
+
         excluded = {".git", ".worktrees", "references", "data", "node_modules", ".venv",
                     "venv", "__pycache__", ".pytest_cache", ".pytest_temp", "dist", "build"}
         extensions = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".md",
                       ".json", ".toml", ".yaml", ".yml"}
         priority = [root / name for name in ("AGENTS.md", "docs/CONTEXT.md", "README.md")]
+        arch_map = root / ".planning" / "codebase" / "architecture.md"
+        if arch_map.is_file() and safe_path(arch_map):
+            priority.append(arch_map)
 
         def source_files(markdown):
+            collected_by_dir: dict[str, list[Path]] = {}
             for directory, dirs, files in os.walk(root, followlinks=False):
                 base = Path(directory)
                 dirs[:] = sorted(
@@ -125,7 +154,29 @@ class OrchestratorCore:
                 for name in sorted(files):
                     file = base / name
                     if file not in priority and (file.suffix == ".md") == markdown:
-                        yield file
+                        top_dir = file.relative_to(root).parts[0] if len(file.relative_to(root).parts) > 1 else "."
+                        collected_by_dir.setdefault(top_dir, []).append(file)
+
+            target_set = set(target_modules or [])
+            if target_set:
+                for top_dir in sorted(collected_by_dir.keys()):
+                    if top_dir in target_set:
+                        for f in collected_by_dir[top_dir]:
+                            yield f
+                for top_dir in sorted(collected_by_dir.keys()):
+                    if top_dir not in target_set:
+                        for f in collected_by_dir[top_dir]:
+                            yield f
+            else:
+                if "." in collected_by_dir:
+                    for f in collected_by_dir["."]:
+                        yield f
+                other_dirs = [d for d in sorted(collected_by_dir.keys()) if d != "."]
+                max_len = max((len(collected_by_dir[d]) for d in other_dirs), default=0)
+                for idx in range(max_len):
+                    for d in other_dirs:
+                        if idx < len(collected_by_dir[d]):
+                            yield collected_by_dir[d][idx]
 
         parts = []
         remaining = limit
@@ -152,8 +203,8 @@ class OrchestratorCore:
             remaining -= len(parts[-1])
         return "".join(parts)
 
-    async def _call_primary(self, task_id, agent, step, prompt, worktree, mock_mode):
-        context = {"worktree_path": worktree, "project_context": self._project_context(worktree),
+    async def _call_primary(self, task_id, agent, step, prompt, worktree, mock_mode, target_modules: Optional[list[str]] = None):
+        context = {"worktree_path": worktree, "project_context": self._project_context(worktree, target_modules=target_modules),
                    "max_output_tokens": self.policy.execution.max_output_tokens}
         estimate = agent.estimate_max_cost(prompt, context)
         reservation = self.budget_guard.reserve_call(task_id, estimate, simulated=mock_mode)
@@ -172,8 +223,12 @@ class OrchestratorCore:
             raise RuntimeError(f"{step} failed: {result.error or 'model returned failure'}")
         if not mock_mode and result.metadata.get("mock"):
             raise RuntimeError("A live task cannot accept a simulated model result")
-        if not result.metadata.get("files_written"):
+        files_written = result.metadata.get("files_written", [])
+        if not files_written:
             raise RuntimeError(f"{step} produced no applicable files")
+        has_sens, sens_path = contains_sensitive_files(files_written)
+        if has_sens:
+            raise ValueError(f"Task attempted to write to sensitive protected path: {sens_path}")
         return result
 
     @staticmethod
@@ -252,6 +307,53 @@ class OrchestratorCore:
             checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, "feat: generated implementation and tests")
             fsm.to_testing()
 
+            sim_suffix = " (simulation; not a live delivery)" if mock_mode else ""
+            return await self._run_test_review_repair_loop(
+                task_id=task_id,
+                fsm=fsm,
+                requirement=requirement,
+                primary=primary,
+                reviewer=reviewer,
+                expert=expert,
+                worktree=worktree,
+                base_ref=base_ref,
+                checkpoint=checkpoint,
+                generated_files=generated_files,
+                mock_mode=mock_mode,
+                custom_test_cmd=custom_test_cmd,
+                plan_content=plan.content,
+                success_suffix=sim_suffix,
+            )
+        except (BudgetLimitError, asyncio.CancelledError, Exception) as error:
+            probe_summary = None
+            try:
+                if "worktree" in locals() and worktree:
+                    probe = await self.worktree_mgr.probe_worktree_status(worktree, base_ref=base_ref if "base_ref" in locals() else None)
+                    probe_summary = probe.summary
+            except Exception:
+                pass
+            return self._handle_execution_exception(task_id, fsm, error, probe_summary=probe_summary)
+
+    async def _run_test_review_repair_loop(
+        self,
+        task_id: str,
+        fsm: TaskLifecycleFSM,
+        requirement: str,
+        primary: Any,
+        reviewer: Any,
+        expert: CodexExpert,
+        worktree: Path,
+        base_ref: str,
+        checkpoint: str,
+        generated_files: set[str],
+        mock_mode: bool,
+        custom_test_cmd: Optional[str] = None,
+        plan_content: Optional[str] = None,
+        success_suffix: str = "",
+    ) -> Task:
+        last_review = None
+        fallback_used = False
+        try:
             while True:
                 self._save_state(task_id, fsm)
                 runner = TestRunner(worktree, custom_test_cmd=custom_test_cmd,
@@ -311,8 +413,7 @@ class OrchestratorCore:
                         )
                         fsm.review_approved = True
                         fsm.to_success()
-                        suffix = " (simulation; not a live delivery)" if mock_mode else ""
-                        return self._finish(task_id, fsm, "Tests and independent review passed" + suffix)
+                        return self._finish(task_id, fsm, f"Tests and independent review passed{success_suffix}")
                     if severity == "P0":
                         fsm.to_escalating_from_review()
                     elif fsm.can_repair() and severity not in {"P0", "P1"} and not fallback_used:
@@ -325,9 +426,10 @@ class OrchestratorCore:
                     fsm.to_escalating_from_test()
 
                 self._save_state(task_id, fsm)
+                plan_section = f"Plan:\n{plan_content}\n" if plan_content else ""
                 if fsm.state == "REPAIRING":
                     repair = await self._call_primary(task_id, primary, f"Repair #{fsm.repair_attempts}",
-                        f"Requirement:\n{requirement}\nPlan:\n{plan.content}\n"
+                        f"Requirement:\n{requirement}\n{plan_section}"
                         f"Test/review rejection evidence:\n{issue}\nRepair the implementation; preserve acceptance tests.",
                         worktree, mock_mode)
                     generated_files.update(repair.metadata.get("files_written", []))
@@ -340,18 +442,20 @@ class OrchestratorCore:
                 expert_available = self.codex_guard.is_available()
                 quota_exhausted = self.policy.codex.enabled and self.codex_guard.state == "EXHAUSTED"
                 with self._session() as session:
-                    task = session.exec(select(Task).where(Task.task_id == task_id)).one()
-                    expert_allowed = expert_available and task.codex_calls < self.policy.codex.max_calls_per_task
+                    task_rec = session.exec(select(Task).where(Task.task_id == task_id)).one()
+                    expert_allowed = expert_available and task_rec.codex_calls < self.policy.codex.max_calls_per_task
                     if expert_allowed and not quota_exhausted:
-                        task.codex_calls += 1
-                        session.add(task)
+                        task_rec.codex_calls += 1
+                        session.add(task_rec)
                         session.commit()
                 if expert_allowed and not quota_exhausted:
                     try:
                         advice = await expert.execute("Diagnose the issue and provide a verifiable repair plan.", context={
                             "worktree_path": worktree,
                             "issue_context": f"Requirement: {requirement}\nSeverity: {severity}\n"
-                                             f"Evidence: {issue}\nTests: {test_result.raw_output}\nDiff:\n{diff}",
+                                             f"Evidence: {redact_and_truncate_evidence(issue)}\n"
+                                             f"Tests: {redact_and_truncate_evidence(test_result.raw_output)}\n"
+                                             f"Diff:\n{redact_and_truncate_evidence(diff)}",
                         })
                         self._log_step(task_id, "Codex Escalation", "EXPERT", "Codex-CLI", advice)
                     except CodexQuotaExhaustedError:
@@ -363,7 +467,7 @@ class OrchestratorCore:
                         issue_description=issue, git_diff_summary=diff,
                         gemini_review_json=json.dumps(last_review) if last_review else None,
                         worktree_path=str(worktree), test_summary=test_result.raw_output,
-                        issue_context=f"Requirement:\n{requirement}\nPlan:\n{plan.content}",
+                        issue_context=f"Requirement:\n{requirement}\n{plan_section}".rstrip(),
                         reason="Confirmed Codex usage limit or persisted exhausted state",
                     )
 
@@ -387,7 +491,7 @@ class OrchestratorCore:
                     patch_prompt = f"Expert advice:\n{advice.content}\nApply the advised implementation repair.\n"
                 self._save_state(task_id, fsm)
                 patch = await self._call_primary(task_id, primary, "Expert/Fallback Repair",
-                    f"Requirement:\n{requirement}\nPlan:\n{plan.content}\n{patch_prompt}\nTests:\n{test_result.raw_output}",
+                    f"Requirement:\n{requirement}\n{plan_section}{patch_prompt}\nTests:\n{test_result.raw_output}",
                     worktree, mock_mode)
                 generated_files.update(patch.metadata.get("files_written", []))
                 checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, "fix: expert or fallback repair")
@@ -396,19 +500,8 @@ class OrchestratorCore:
                     "Repair committed; validation pending"
                 )
                 fsm.to_testing()
-
-        except BudgetLimitError as error:
-            fsm.to_budget_stopped()
-            self._log_step(task_id, "Budget Stop", "SYSTEM", "Orchestrator", error=str(error))
-            return self._finish(task_id, fsm, str(error))
-        except asyncio.CancelledError:
-            fsm.to_interrupted()
-            self._finish(task_id, fsm, "Execution interrupted; automatic delivery withheld")
-            raise
-        except Exception as error:
-            fsm.to_failed()
-            self._log_step(task_id, "Fatal Exception", "SYSTEM", "Orchestrator", error=str(error))
-            return self._finish(task_id, fsm, f"Execution failed: {error}")
+        except (BudgetLimitError, asyncio.CancelledError, Exception) as error:
+            return self._handle_execution_exception(task_id, fsm, error)
 
     async def resume_task_after_approval(
         self,
@@ -478,178 +571,43 @@ class OrchestratorCore:
         requirement = task.requirement
         generated_files = set(self._test_paths(worktree, []) or [])
 
-        # Execute repair with Primary Agent incorporating operator instructions
-        repair_prompt = (
-            f"Requirement:\n{requirement}\n\n"
-            f"Human Operator Approval:\n{decision_note}\n\n"
-            "Apply the authorized implementation repair and ensure all tests pass. Do not weaken tests."
-        )
-        repair_res = await self._call_primary(
-            task_id, primary, f"Approved Repair #{fsm.repair_attempts}", repair_prompt, worktree, mock_mode
-        )
-        generated_files.update(repair_res.metadata.get("files_written", []))
-        checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, f"fix: human approved repair #{fsm.repair_attempts}")
-        fsm.to_testing()
-
-        # Strict testing and review loop (FSM verified delivery)
-        last_review = None
-        fallback_used = False
         try:
-            while True:
-                self._save_state(task_id, fsm)
-                runner = TestRunner(worktree, custom_test_cmd=custom_test_cmd,
-                                    test_paths=self._test_paths(worktree, generated_files) or None)
-                test_result = await runner.run(timeout=self.policy.execution.timeout_seconds)
-                current_diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
-                self.codex_guard.update_pending_evidence(
-                    task_id, checkpoint, current_diff, test_result.raw_output
-                )
-                fsm.tests_passed = test_result.passed
-                fsm.review_approved = False
-                self._log_step(task_id, f"Testing (attempt {fsm.repair_attempts})", "TEST_RUNNER", "LocalRunner",
-                               AgentResult(test_result.passed, test_result.raw_output,
-                                           error=None if test_result.passed else test_result.summary))
-                issue = test_result.raw_output
-                severity = "P1"
+            # Execute repair with Primary Agent incorporating operator instructions
+            repair_prompt = (
+                f"Requirement:\n{requirement}\n\n"
+                f"Human Operator Approval:\n{decision_note}\n\n"
+                "Apply the authorized implementation repair and ensure all tests pass. Do not weaken tests."
+            )
+            repair_res = await self._call_primary(
+                task_id, primary, f"Approved Repair #{fsm.repair_attempts}", repair_prompt, worktree, mock_mode
+            )
+            generated_files.update(repair_res.metadata.get("files_written", []))
+            checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, f"fix: human approved repair #{fsm.repair_attempts}")
+            fsm.to_testing()
 
-                if test_result.passed:
-                    fsm.to_reviewing()
-                    self._save_state(task_id, fsm)
-                    diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
-                    uses_live_codex = not mock_mode and self.policy.reviewer_agent == "codex_cli"
-                    if uses_live_codex:
-                        self.codex_guard._sync_state_from_db()
-                        if self.codex_guard.state == "EXHAUSTED":
-                            return self._defer_codex_review(
-                                task_id, fsm, checkpoint, diff, test_result.raw_output, worktree,
-                                requirement, "Persisted Codex subscription quota exhausted",
-                            )
-                    try:
-                        review_result = await reviewer.execute("Review requirements, code and actual test evidence.", context={
-                            "worktree_path": worktree, "git_diff": diff, "test_summary": test_result.raw_output,
-                            "requirement": requirement,
-                            "expected_commit_sha": checkpoint,
-                        })
-                    except CodexQuotaExhaustedError as quota_error:
-                        if not uses_live_codex:
-                            raise
-                        return self._defer_codex_review(
-                            task_id, fsm, checkpoint, diff, test_result.raw_output, worktree,
-                            requirement, str(quota_error),
-                        )
-                    reviewer_model = getattr(reviewer, "model_name", self.policy.reviewer_agent)
-                    actual_review_model = review_result.metadata.get("review_model") or reviewer_model
-                    self._log_step(task_id, f"{reviewer_model} Review", "REVIEWER", actual_review_model, review_result)
-                    if not review_result.success:
-                        raise RuntimeError(f"Independent review failed: {review_result.error}")
-                    last_review = review_result.metadata.get("review")
-                    if (not isinstance(last_review, dict) or type(last_review.get("approved")) is not bool
-                            or last_review.get("severity") not in {"P0", "P1", "P2", "P3"}):
-                        raise RuntimeError("Independent review did not provide a valid verdict")
-                    severity = last_review["severity"]
-                    issue = review_result.content
-                    if last_review["approved"] and severity not in {"P0", "P1"}:
-                        self.codex_guard.update_pending_evidence(
-                            task_id, checkpoint, diff, test_result.raw_output, json.dumps(last_review)
-                        )
-                        fsm.review_approved = True
-                        fsm.to_success()
-                        suffix = " (simulation; not a live delivery)" if mock_mode else ""
-                        return self._finish(task_id, fsm, "Tests and independent review passed after human approval" + suffix)
-                    if severity == "P0":
-                        fsm.to_waiting_approval()
-                        return self._finish(task_id, fsm, "P0 risk requires authorized human approval; no automatic expert patch applied")
-                    elif fsm.can_repair() and severity not in {"P0", "P1"} and not fallback_used:
-                        fsm.to_repairing_from_review()
-                    else:
-                        fsm.to_escalating_from_review()
-                elif fsm.can_repair() and not fallback_used:
-                    fsm.to_repairing()
-                else:
-                    fsm.to_escalating_from_test()
-
-                self._save_state(task_id, fsm)
-                if fsm.state == "REPAIRING":
-                    repair = await self._call_primary(task_id, primary, f"Repair #{fsm.repair_attempts}",
-                        f"Requirement:\n{requirement}\n"
-                        f"Test/review rejection evidence:\n{issue}\nRepair the implementation; preserve acceptance tests.",
-                        worktree, mock_mode)
-                    generated_files.update(repair.metadata.get("files_written", []))
-                    checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, f"fix: repair #{fsm.repair_attempts}")
-                    fsm.to_testing()
-                    continue
-
-                # Escalation
-                diff = await self.worktree_mgr.get_diff(worktree, base_ref=base_ref)
-                advice = None
-                expert_available = self.codex_guard.is_available()
-                quota_exhausted = self.policy.codex.enabled and self.codex_guard.state == "EXHAUSTED"
-                with self._session() as session:
-                    task_rec = session.exec(select(Task).where(Task.task_id == task_id)).one()
-                    expert_allowed = expert_available and task_rec.codex_calls < self.policy.codex.max_calls_per_task
-                    if expert_allowed and not quota_exhausted:
-                        task_rec.codex_calls += 1
-                        session.add(task_rec)
-                        session.commit()
-                if expert_allowed and not quota_exhausted:
-                    try:
-                        advice = await expert.execute("Diagnose the issue and provide a verifiable repair plan.", context={
-                            "worktree_path": worktree,
-                            "issue_context": f"Requirement: {requirement}\nSeverity: {severity}\n"
-                                             f"Evidence: {issue}\nTests: {test_result.raw_output}\nDiff:\n{diff}",
-                        })
-                        self._log_step(task_id, "Codex Escalation", "EXPERT", "Codex-CLI", advice)
-                    except CodexQuotaExhaustedError:
-                        quota_exhausted = True
-
-                if quota_exhausted:
-                    self.codex_guard.handle_quota_exhausted(
-                        task_id=task_id, commit_sha=checkpoint, severity=severity,
-                        issue_description=issue, git_diff_summary=diff,
-                        gemini_review_json=json.dumps(last_review) if last_review else None,
-                        worktree_path=str(worktree), test_summary=test_result.raw_output,
-                        issue_context=f"Requirement:\n{requirement}",
-                        reason="Confirmed Codex usage limit or persisted exhausted state",
-                    )
-
-                if severity == "P0":
-                    fsm.to_waiting_approval()
-                    return self._finish(task_id, fsm, "P0 risk requires authorized human approval; no automatic expert patch applied")
-                if not expert_allowed and not quota_exhausted:
-                    fsm.to_waiting_review()
-                    return self._finish(task_id, fsm, "Expert review disabled or task call limit reached")
-                if advice is not None and not advice.success:
-                    raise RuntimeError(f"Expert review failed: {advice.error}")
-                if quota_exhausted:
-                    if fallback_used:
-                        raise RuntimeError("Fallback did not pass tests and independent review; audit remains queued")
-                    fallback_used = True
-                    fsm.to_codex_backlogged()
-                    fsm.to_repairing_from_backlog()
-                    patch_prompt = f"Codex is unavailable. Independently diagnose and repair this P1 issue:\n{issue}\n"
-                else:
-                    fsm.to_repairing_from_codex()
-                    patch_prompt = f"Expert advice:\n{advice.content}\nApply the advised implementation repair.\n"
-                self._save_state(task_id, fsm)
-                patch = await self._call_primary(task_id, primary, "Expert/Fallback Repair",
-                    f"Requirement:\n{requirement}\n{patch_prompt}\nTests:\n{test_result.raw_output}",
-                    worktree, mock_mode)
-                generated_files.update(patch.metadata.get("files_written", []))
-                checkpoint = await self.worktree_mgr.commit_checkpoint(worktree, "fix: expert or fallback repair")
-                self.codex_guard.update_pending_evidence(
-                    task_id, checkpoint, await self.worktree_mgr.get_diff(worktree, base_ref=base_ref),
-                    "Repair committed; validation pending"
-                )
-                fsm.to_testing()
-        except BudgetLimitError as error:
-            fsm.to_budget_stopped()
-            self._log_step(task_id, "Budget Stop", "SYSTEM", "Orchestrator", error=str(error))
-            return self._finish(task_id, fsm, str(error))
-        except asyncio.CancelledError:
-            fsm.to_interrupted()
-            self._finish(task_id, fsm, "Execution interrupted; automatic delivery withheld")
-            raise
-        except Exception as error:
-            fsm.to_failed()
-            self._log_step(task_id, "Fatal Exception", "SYSTEM", "Orchestrator", error=str(error))
-            return self._finish(task_id, fsm, f"Execution failed: {error}")
+            sim_suffix = " (simulation; not a live delivery)" if mock_mode else ""
+            return await self._run_test_review_repair_loop(
+                task_id=task_id,
+                fsm=fsm,
+                requirement=requirement,
+                primary=primary,
+                reviewer=reviewer,
+                expert=expert,
+                worktree=worktree,
+                base_ref=base_ref,
+                checkpoint=checkpoint,
+                generated_files=generated_files,
+                mock_mode=mock_mode,
+                custom_test_cmd=custom_test_cmd,
+                plan_content=None,
+                success_suffix=" after human approval" + sim_suffix,
+            )
+        except (BudgetLimitError, asyncio.CancelledError, Exception) as error:
+            probe_summary = None
+            try:
+                if "worktree" in locals() and worktree:
+                    probe = await self.worktree_mgr.probe_worktree_status(worktree, base_ref=base_ref if "base_ref" in locals() else None)
+                    probe_summary = probe.summary
+            except Exception:
+                pass
+            return self._handle_execution_exception(task_id, fsm, error, probe_summary=probe_summary)

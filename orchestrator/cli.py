@@ -125,24 +125,27 @@ async def watch_codex_backlog(mock_mode=False, interval=300, cycles=None):
             await asyncio.sleep(interval)
 
 
-async def execute_task(req, model, mock, title, *, repo_root=None, test_command=None):
+async def execute_task(req, model, mock, title, *, repo_root=None, test_command=None, quiet=False):
     model = model or settings.load_policy().primary_agent
-    console.print(Panel(
-        f"需求: {req}\n引擎: {model}（单任务二选一）\n"
-        f"模式: {'显式模拟，使用独立账库' if mock else '真实调用'}",
-        title="启动任务", border_style="cyan"))
+    if not quiet:
+        console.print(Panel(
+            f"需求: {req}\n引擎: {model}（单任务二选一）\n"
+            f"模式: {'显式模拟，使用独立账库' if mock else '真实调用'}",
+            title="启动任务", border_style="cyan"))
     with _core_scope(mock=mock, repo_root=repo_root) as core:
         task = await core.run_task(req, title=title, chosen_model=model, mock_mode=mock,
                                    custom_test_cmd=test_command)
-    console.print(Panel(
-        f"任务: {task.task_id}\n状态: {task.state}\n费用估算: ¥{task.total_cost_cny:.5f}\n"
-        f"工作目录: {task.worktree_path}\n{task.result_summary}",
-        title="模拟结果" if mock else "任务结果",
+    if not quiet:
+        console.print(Panel(
+            f"任务: {task.task_id}\n状态: {task.state}\n费用估算: ¥{task.total_cost_cny:.5f}\n"
+            f"工作目录: {task.worktree_path}\n{task.result_summary}",
+            title="模拟结果" if mock else "任务结果",
         border_style="green" if task.state == "SUCCESS" else "yellow"))
     return task
 
 
-async def execute_multica_issue(issue_id, title, task_req, model, mock, *, repo_root=None, test_command=None, persistence_file=None):
+async def execute_multica_issue(issue_id, title, task_req, model, mock, *, repo_root=None,
+                                test_command=None, persistence_file=None, quiet=False):
     persistence_path = Path(persistence_file) if persistence_file else Path("data/multica_board.json")
     client = MemoryMulticaClient(persistence_file=persistence_path)
     existing = await client.get_issue(issue_id)
@@ -170,17 +173,18 @@ async def execute_multica_issue(issue_id, title, task_req, model, mock, *, repo_
             issue, chosen_model=model, mock_mode=mock, custom_test_cmd=test_command
         )
 
-    console.print(Panel(
-        f"Multica Issue: {result.issue_id}\n"
-        f"看板状态: {result.multica_status}\n"
-        f"核心状态机: {result.fsm_state}\n"
-        f"开发分支: {result.branch_name}\n"
-        f"总费用估算: ¥{result.total_cost_cny:.5f}\n"
-        f"已回写评论: {len(result.comments_posted)} 条\n"
-        f"最新报告总结: {result.summary}",
-        title="Multica 任务执行完成",
-        border_style="green" if result.multica_status == "done" else "yellow",
-    ))
+    if not quiet:
+        console.print(Panel(
+            f"Multica Issue: {result.issue_id}\n"
+            f"看板状态: {result.multica_status}\n"
+            f"核心状态机: {result.fsm_state}\n"
+            f"开发分支: {result.branch_name}\n"
+            f"总费用估算: ¥{result.total_cost_cny:.5f}\n"
+            f"已回写评论: {len(result.comments_posted)} 条\n"
+            f"最新报告总结: {result.summary}",
+            title="Multica 任务执行完成",
+            border_style="green" if result.multica_status == "done" else "yellow",
+        ))
     return result
 
 

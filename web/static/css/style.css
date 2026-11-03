@@ -141,3 +141,182 @@ pre.code-box {
     box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
   }
 }
+
+/* Live Run Console - Agent output stream */
+.run-stream {
+  background: #090d16;
+  color: #cbd5e1;
+  scrollbar-gutter: stable;
+}
+
+.run-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 1px 0;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.run-line .run-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.run-agent {
+  flex: 0 0 auto;
+  display: inline-block;
+  min-width: 3.6rem;
+  margin-top: 1px;
+  padding: 0 0.3rem;
+  border-radius: 0.25rem;
+  border: 1px solid transparent;
+  font-size: 0.6rem;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-align: center;
+  opacity: 0.9;
+}
+
+.run-agent-gemini {
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.3);
+}
+.run-agent-glm {
+  color: #c4b5fd;
+  background: rgba(139, 92, 246, 0.12);
+  border-color: rgba(139, 92, 246, 0.3);
+}
+.run-agent-deepseek {
+  color: #93c5fd;
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(59, 130, 246, 0.3);
+}
+.run-agent-pytest {
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.3);
+}
+.run-agent-human {
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.3);
+}
+.run-agent-system {
+  color: #94a3b8;
+  background: rgba(100, 116, 139, 0.12);
+  border-color: rgba(100, 116, 139, 0.3);
+}
+
+.run-line-test {
+  color: #a5b4fc;
+}
+.run-line-stderr {
+  color: #fbbf24;
+}
+.run-line-error {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.06);
+}
+.run-line-tool {
+  color: #93c5fd;
+}
+.run-tool-result {
+  color: #86efac;
+}
+.run-tool-policy {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.06);
+}
+
+/* Live Run Console - Timeline */
+.run-timeline-item {
+  padding: 0.35rem 0.5rem;
+  border-left: 2px solid #334155;
+  border-radius: 0 0.4rem 0.4rem 0;
+  background: rgba(15, 23, 42, 0.55);
+}
+.run-timeline-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+}
+.run-timeline-time {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.62rem;
+  color: #64748b;
+  padding-top: 1px;
+}
+.run-timeline-text {
+  font-size: 0.7rem;
+  line-height: 1.45;
+  color: #cbd5e1;
+  word-break: break-word;
+}
+.run-timeline-detail {
+  margin-left: 3.9rem;
+  margin-top: 0.15rem;
+  font-size: 0.62rem;
+  line-height: 1.4;
+  color: #94a3b8;
+  word-break: break-word;
+}
+
+.run-tone-active {
+  border-left-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.08);
+}
+.run-tone-success {
+  border-left-color: #34d399;
+  background: rgba(16, 185, 129, 0.07);
+}
+.run-tone-error {
+  border-left-color: #f87171;
+  background: rgba(239, 68, 68, 0.08);
+}
+.run-tone-warn {
+  border-left-color: #fbbf24;
+  background: rgba(245, 158, 11, 0.07);
+}
+.run-tone-state {
+  border-left-color: #a78bfa;
+  background: rgba(139, 92, 246, 0.07);
+}
+.run-tone-neutral {
+  border-left-color: #475569;
+}
+
+/* Live Run Console - Diff preview */
+.run-diff {
+  background: #090d16;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.68rem;
+  line-height: 1.5;
+  white-space: pre;
+  word-break: normal;
+  min-height: 120px;
+}
+.run-diff .diff-line {
+  padding: 0 0.35rem;
+}
+.run-diff .diff-add {
+  color: #4ade80;
+  background: rgba(34, 197, 94, 0.12);
+}
+.run-diff .diff-del {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.12);
+}
+.run-diff .diff-hunk {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.08);
+}
+.run-diff .diff-meta {
+  color: #94a3b8;
+}

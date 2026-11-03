@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from pathlib import Path
+from execution.events import EventStore
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,7 +16,7 @@ from agents.base import AgentResult
 from agents.flash_reviewer import FlashReviewer
 from agents.gemini_dev_agent import GeminiDevAgent
 import sys
-from config.settings import PolicyConfig, settings
+from config.settings import PROJECT_ROOT, ExecutionConfig, PolicyConfig, settings
 from integrations.hermes.bridge import HermesCooperationBridge
 from orchestrator.gemini_closed_loop import (
     ClosedLoopResult,
@@ -24,6 +27,205 @@ from orchestrator.gemini_closed_loop import (
     validate_custom_test_cmd,
 )
 from storage.models import ExecutionLog, Task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_approved", [True, False])
+async def test_approval_claim_prevents_competing_decisions(tmp_path, second_approved):
+    """Separate database sessions cannot execute competing approval decisions."""
+    engine = create_engine(f"sqlite:///{(tmp_path / 'claims.db').as_posix()}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as setup:
+        setup.add(Task(task_id="claim", title="claim", requirement="test", state="WAITING_APPROVAL"))
+        setup.commit()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def blocked_impl(**kwargs):
+        calls.append(kwargs["approved"])
+        entered.set()
+        await release.wait()
+        return ClosedLoopResult(task_id="claim", success=False, state="FAILED", result_summary="done", repair_attempts=0)
+
+    with Session(engine) as first_session, Session(engine) as second_session:
+        first = GeminiClosedLoopOrchestrator(repo_root=tmp_path, session=first_session, event_store=EventStore(tmp_path / "events"))
+        second = GeminiClosedLoopOrchestrator(repo_root=tmp_path, session=second_session, event_store=EventStore(tmp_path / "events"))
+        first._resume_impl = blocked_impl
+        second._resume_impl = blocked_impl
+        running = asyncio.create_task(first.resume_after_approval("claim", True))
+        await asyncio.wait_for(entered.wait(), 2)
+        try:
+            with pytest.raises(ValueError, match="WAITING_APPROVAL"):
+                await asyncio.wait_for(second.resume_after_approval("claim", second_approved), 0.5)
+        finally:
+            release.set()
+            await running
+        assert calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_approval_releases_its_claim(tmp_path):
+    engine = create_engine(f"sqlite:///{(tmp_path / 'cancel.db').as_posix()}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(Task(task_id="cancel", title="cancel", requirement="test", state="WAITING_APPROVAL"))
+        session.commit()
+        orchestrator = GeminiClosedLoopOrchestrator(repo_root=tmp_path, session=session, event_store=EventStore(tmp_path / "events"))
+        entered = asyncio.Event()
+
+        async def blocked_impl(**kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        orchestrator._resume_impl = blocked_impl
+        running = asyncio.create_task(orchestrator.resume_after_approval("cancel", True))
+        await asyncio.wait_for(entered.wait(), 2)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        session.expire_all()
+        task = session.exec(select(Task).where(Task.task_id == "cancel")).one()
+        assert task.state == "WAITING_APPROVAL"
+        assert task.approval_claim_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_repair_requires_manual_review(mock_git_repo, test_db_session):
+    orchestrator = GeminiClosedLoopOrchestrator(repo_root=mock_git_repo, session=test_db_session,
+                                                event_store=EventStore(mock_git_repo.parent / "events"))
+    test_db_session.add(Task(task_id="cancel_model", title="cancel", requirement="test",
+                             state="WAITING_APPROVAL", repo_root=str(mock_git_repo)))
+    test_db_session.commit()
+    entered = asyncio.Event()
+
+    async def executing_model(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    dev = SimpleNamespace(model_name="mock", execute=executing_model)
+    running = asyncio.create_task(orchestrator.resume_after_approval("cancel_model", True, mock_mode=True, dev_agent=dev))
+    await asyncio.wait_for(entered.wait(), 30)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    test_db_session.expire_all()
+    task = test_db_session.exec(select(Task).where(Task.task_id == "cancel_model")).one()
+    assert task.state == "INTERRUPTED"
+    assert "inspect side effects and costs" in task.result_summary
+    with pytest.raises(ValueError, match="WAITING_APPROVAL"):
+        await orchestrator.resume_after_approval("cancel_model", True, mock_mode=True, dev_agent=dev)
+
+
+def test_approval_restore_cannot_release_another_owner(tmp_path):
+    engine = create_engine(f"sqlite:///{(tmp_path / 'owners.db').as_posix()}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(Task(task_id="owned", title="owned", requirement="test", state="REPAIRING", approval_claim_id="new"))
+        session.commit()
+        orchestrator = GeminiClosedLoopOrchestrator(repo_root=tmp_path, session=session)
+        assert orchestrator._restore_approval_state("owned", False, "old", claim_id="old") == "REPAIRING"
+        orchestrator._release_approval_claim("owned", False, "old")
+        session.expire_all()
+        task = session.exec(select(Task).where(Task.task_id == "owned")).one()
+        assert task.state == "REPAIRING"
+        assert task.approval_claim_id == "new"
+
+
+def test_approval_claim_across_independent_processes(tmp_path):
+    """Two processes share one ledger; only one can enter the approval body."""
+    import subprocess
+    import time
+
+    db_path = tmp_path / "processes.db"
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(Task(task_id="process", title="process", requirement="test", state="WAITING_APPROVAL"))
+        session.commit()
+    script = r'''
+import asyncio, os, sys, time
+from pathlib import Path
+from sqlmodel import Session, create_engine
+from orchestrator.gemini_closed_loop import GeminiClosedLoopOrchestrator, ClosedLoopResult
+root = Path(sys.argv[1])
+number = sys.argv[2]
+engine = create_engine("sqlite:///" + (root / "processes.db").as_posix())
+async def run():
+    with Session(engine) as session:
+        obj = GeminiClosedLoopOrchestrator(repo_root=root, session=session)
+        obj._finalize_events = lambda **kwargs: None
+        async def work(**kwargs):
+            # Stand in for the first budget/model entry; no external call occurs.
+            (root / ("budget-entry-" + number)).touch()
+            while not (root / "release").exists():
+                await asyncio.sleep(0.01)
+            return ClosedLoopResult(task_id="process", success=False, state="FAILED", result_summary="offline", repair_attempts=0)
+        obj._resume_impl = work
+        (root / ("ready-" + number)).touch()
+        while not (root / "go").exists():
+            await asyncio.sleep(0.01)
+        try:
+            await obj.resume_after_approval("process", number == "0")
+            print("won", flush=True)
+        except ValueError:
+            print("conflict", flush=True)
+asyncio.run(run())
+'''
+    processes = [subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path), str(i)],
+        cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) for i in range(2)]
+    try:
+        deadline = time.monotonic() + 30
+        while not all((tmp_path / f"ready-{i}").exists() for i in range(2)):
+            assert time.monotonic() < deadline and all(p.poll() is None for p in processes)
+            time.sleep(0.02)
+        (tmp_path / "go").touch()
+        while all(p.poll() is None for p in processes):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert len(list(tmp_path.glob("budget-entry-*"))) == 1
+    finally:
+        (tmp_path / "release").touch()
+        outputs = [p.communicate(timeout=15) for p in processes]
+    assert all(p.returncode == 0 for p in processes), outputs
+    assert sorted(out.strip() for out, _ in outputs) == ["conflict", "won"]
+
+
+def test_concurrent_processes_migrate_approval_claim_column(tmp_path):
+    import subprocess
+    import time
+
+    engine = create_engine(f"sqlite:///{(tmp_path / 'migration.db').as_posix()}")
+    SQLModel.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN approval_claim_id")
+    script = r'''
+import sys, time
+from pathlib import Path
+from sqlmodel import create_engine
+from storage.db import init_db
+root = Path(sys.argv[1]); number = sys.argv[2]
+(root / ("ready-" + number)).touch()
+while not (root / "go").exists(): time.sleep(0.01)
+init_db(create_engine("sqlite:///" + (root / "migration.db").as_posix()))
+'''
+    processes = [subprocess.Popen([sys.executable, "-c", script, str(tmp_path), str(i)],
+                                  cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for i in range(2)]
+    try:
+        deadline = time.monotonic() + 30
+        while not all((tmp_path / f"ready-{i}").exists() for i in range(2)):
+            assert time.monotonic() < deadline and all(p.poll() is None for p in processes)
+            time.sleep(0.02)
+    finally:
+        (tmp_path / "go").touch()
+        outputs = [p.communicate(timeout=15) for p in processes]
+    assert all(p.returncode == 0 for p in processes), outputs
+    with engine.connect() as conn:
+        columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(tasks)")}
+    assert "approval_claim_id" in columns
 
 HERMES_ROOT = Path(__file__).resolve().parents[1] / "hermes-agent"
 if str(HERMES_ROOT) not in sys.path:
@@ -469,13 +671,15 @@ async def test_closed_loop_gate_rejects_dirty_worktree_after_test(mock_git_repo,
 
 
 @pytest.mark.asyncio
-async def test_closed_loop_p0_persistence_and_approval_resume(mock_git_repo, test_db_session):
+async def test_closed_loop_p0_persistence_and_approval_resume(mock_git_repo, test_db_session, tmp_path):
     """Test full cycle: P0 halts in WAITING_APPROVAL -> resume with human approval -> Gemini repairs and succeeds."""
+    store = EventStore(tmp_path / "events")
     orchestrator = GeminiClosedLoopOrchestrator(
         repo_root=mock_git_repo,
         session=test_db_session,
         reviewer_choice="glm",
         max_repair_attempts=3,
+        event_store=store,
     )
 
     dev_agent = GeminiDevAgent(mock_mode=True)
@@ -505,6 +709,11 @@ async def test_closed_loop_p0_persistence_and_approval_resume(mock_git_repo, tes
 
     assert result.state == "WAITING_APPROVAL"
     task_id = result.task_id
+
+    paused_result = store.read(task_id)[-1]
+    assert paused_result.type == "result"
+    assert paused_result.payload["terminal"] is False
+    assert paused_result.is_terminal is False
 
     # 1. Test human rejection transitions to FAILED
     reject_res = await orchestrator.resume_after_approval(
@@ -553,6 +762,780 @@ async def test_closed_loop_p0_persistence_and_approval_resume(mock_git_repo, tes
     assert resume_res.state == "SUCCESS"
     assert resume_res.repair_attempts >= 1
     assert "Verified closed-loop delivery after human approval" in resume_res.result_summary
+
+    resumed_result = store.read(task_id)[-1]
+    assert resumed_result.type == "result"
+    assert resumed_result.payload["terminal"] is True
+    assert resumed_result.is_terminal is True
+
+
+@pytest.mark.asyncio
+async def test_approved_repair_blocks_untrusted_test_code(mock_git_repo, test_db_session):
+    """Approved repairs must still apply the untrusted-test gate before execution."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_untrusted_repair"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="untrusted repair",
+            requirement="Repair with a new test",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def fake_execute(prompt, context=None):
+        return AgentResult(
+            success=True,
+            content="",
+            metadata={
+                "files_written": ["tests/test_evil.py"],
+                "native_tool_steps": [{"name": "write_to_file", "succeeded": True, "parameters": {}}],
+            },
+        )
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=fake_execute)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        notes="Apply the fix",
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert "Untrusted test code" in result.result_summary
+
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+        assert task.state == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_approved_repair_blocks_shell_written_tests(mock_git_repo, test_db_session):
+    """Tests created through shell commands must still trip the untrusted gate."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_shell_tests"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="shell written tests",
+            requirement="Repair",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def fake_execute(prompt, context=None):
+        worktree = Path(context["worktree_path"])
+        (worktree / "tests").mkdir(exist_ok=True)
+        (worktree / "tests" / "test_shell.py").write_text(
+            "def test_shell():\n    assert True\n", encoding="utf-8"
+        )
+        (worktree / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n# repaired\n", encoding="utf-8"
+        )
+        return AgentResult(
+            success=True,
+            content="",
+            metadata={
+                "files_written": ["calc.py"],
+                "native_tool_steps": [{"name": "write_to_file", "succeeded": True, "parameters": {}}],
+            },
+        )
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=fake_execute)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        notes="Apply the fix",
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert "Untrusted test code" in result.result_summary
+    assert "tests/test_shell.py" in result.result_summary
+
+
+@pytest.mark.asyncio
+async def test_resume_budget_block_keeps_task_waiting(mock_git_repo, test_db_session, tmp_path):
+    """A live budget pre-flight must leave the paused task retryable."""
+    store = EventStore(tmp_path / "events")
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+        event_store=store,
+    )
+    task_id = "task_budget_pause"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="budget pause",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    orchestrator.budget_guard.check_can_start_new_task = lambda: (False, "Monthly budget exhausted")
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id, approved=True, mock_mode=False,
+    )
+
+    assert result.success is False
+    assert result.state == "WAITING_APPROVAL"
+    assert "Monthly budget exhausted" in result.result_summary
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+        assert task.state == "WAITING_APPROVAL"
+    last = store.read(task_id)[-1]
+    assert last.type == "result"
+    assert last.payload["terminal"] is False
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_requires_review_after_execution_starts(mock_git_repo, test_db_session, tmp_path):
+    """A worktree operation may have side effects even if it raises."""
+    store = EventStore(tmp_path / "events")
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+        event_store=store,
+    )
+    task_id = "task_resume_failure"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="resume failure",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("worktree unavailable")
+
+    with patch.object(orchestrator.worktree_mgr, "create_worktree", side_effect=boom):
+        with pytest.raises(RuntimeError, match="worktree unavailable"):
+            await orchestrator.resume_after_approval(
+                task_id=task_id, approved=True, mock_mode=False,
+            )
+
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+        assert task.state == "INTERRUPTED"
+    last = store.read(task_id)[-1]
+    assert last.type == "result"
+    assert last.payload["terminal"] is True
+
+
+@pytest.mark.parametrize("path", [
+    "conftest.py",
+    "tests/conftest.py",
+    "pytest.ini",
+    "pyproject.toml",
+    "Tests/helpers.py",
+    "TEST_calc.py",
+])
+def test_untrusted_detector_includes_pytest_config_and_case_variants(path):
+    """Pytest hooks and config execute code, so they must trip the same gate as tests."""
+    assert GeminiClosedLoopOrchestrator._detect_modified_or_new_tests(
+        ["calc.py", path]
+    ) == [path]
+
+
+@pytest.mark.asyncio
+async def test_resume_blocks_tests_committed_in_paused_segment(mock_git_repo, test_db_session):
+    """Tests committed before the pause must not execute on a resume without opt-in."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_prior_untrusted"
+    worktree = await orchestrator.worktree_mgr.create_worktree(task_id)
+    (worktree / "tests").mkdir(exist_ok=True)
+    (worktree / "tests" / "test_prior.py").write_text(
+        "def test_prior():\n    assert True\n", encoding="utf-8"
+    )
+    (worktree / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n# first segment\n", encoding="utf-8"
+    )
+    await orchestrator.worktree_mgr.commit_checkpoint(worktree, "feat: paused segment")
+
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="prior untrusted",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            worktree_path=str(worktree),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("dev agent must not run before the prior-test gate")
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=must_not_run)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        notes="Apply the fix",
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.success is False
+    assert result.state == "WAITING_APPROVAL"
+    assert "tests/test_prior.py" in result.result_summary
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+        assert task.state == "WAITING_APPROVAL"
+
+
+@pytest.mark.asyncio
+async def test_resume_blocks_test_committed_by_dev_during_repair(mock_git_repo, test_db_session):
+    """A dev call that commits its own test file must not bypass the gate via clean status."""
+    import subprocess
+
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_sneaky_commit"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="sneaky commit",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def fake_execute(prompt, context=None):
+        worktree = Path(context["worktree_path"])
+        (worktree / "tests").mkdir(exist_ok=True)
+        (worktree / "tests" / "test_sneaky.py").write_text(
+            "def test_sneaky():\n    assert True\n", encoding="utf-8"
+        )
+        (worktree / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n# repair\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "-A"], cwd=worktree, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "sneaky repair"], cwd=worktree, check=True, capture_output=True
+        )
+        return AgentResult(
+            success=True,
+            content="",
+            metadata={
+                "files_written": ["calc.py"],
+                "native_tool_steps": [{"name": "write_to_file", "succeeded": True, "parameters": {}}],
+            },
+        )
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=fake_execute)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert "tests/test_sneaky.py" in result.result_summary
+
+
+@pytest.mark.asyncio
+async def test_resume_blocks_gitignored_test_written_by_dev(mock_git_repo, test_db_session):
+    """Ignored test files must trip the gate even though git status hides them by default."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_ignored_test"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="ignored test",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def fake_execute(prompt, context=None):
+        worktree = Path(context["worktree_path"])
+        (worktree / ".gitignore").write_text("tests/\n", encoding="utf-8")
+        (worktree / "tests").mkdir(exist_ok=True)
+        (worktree / "tests" / "test_ignored.py").write_text(
+            "def test_ignored():\n    assert True\n", encoding="utf-8"
+        )
+        (worktree / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n# repair\n", encoding="utf-8"
+        )
+        return AgentResult(
+            success=True,
+            content="",
+            metadata={
+                "files_written": ["calc.py"],
+                "native_tool_steps": [{"name": "write_to_file", "succeeded": True, "parameters": {}}],
+            },
+        )
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=fake_execute)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert "tests/" in result.result_summary
+
+
+@pytest.mark.asyncio
+async def test_normal_repair_blocks_test_committed_by_dev(mock_git_repo, test_db_session):
+    """The first-pass repair loop must also detect tests committed by run_command."""
+    import subprocess
+
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+        max_repair_attempts=2,
+    )
+    calls = {"dev": 0}
+
+    async def fake_dev(prompt, context=None):
+        calls["dev"] += 1
+        worktree = Path(context["worktree_path"])
+        if calls["dev"] == 1:
+            (worktree / "calc.py").write_text(
+                "def add(a, b):\n    return a + b + 0\n", encoding="utf-8"
+            )
+            return AgentResult(
+                success=True,
+                content="",
+                metadata={
+                    "files_written": ["calc.py"],
+                    "native_tool_steps": [{"name": "write_to_file", "succeeded": True, "parameters": {}}],
+                },
+            )
+        (worktree / "tests").mkdir(exist_ok=True)
+        (worktree / "tests" / "test_evil.py").write_text(
+            "def test_evil():\n    assert True\n", encoding="utf-8"
+        )
+        (worktree / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n# repaired\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "-A"], cwd=worktree, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "sneaky repair"], cwd=worktree, check=True, capture_output=True
+        )
+        return AgentResult(
+            success=True,
+            content="",
+            metadata={
+                "files_written": ["calc.py"],
+                "native_tool_steps": [{"name": "write_to_file", "succeeded": True, "parameters": {}}],
+            },
+        )
+
+    async def rejecting_review(prompt, context=None):
+        return AgentResult(
+            success=True,
+            content="",
+            metadata={
+                "review": {
+                    "approved": False,
+                    "severity": "P1",
+                    "summary": "needs repair",
+                    "critical_issues": ["style"],
+                    "suggestions": [],
+                }
+            },
+        )
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=fake_dev)
+    reviewer_agent = SimpleNamespace(
+        model_name="glm-5.3-flashx", model_key="glm", execute=rejecting_review,
+    )
+
+    result = await orchestrator.run(
+        requirement="Repair safely",
+        mock_mode=False,
+        dev_agent=dev_agent,
+        reviewer_agent=reviewer_agent,
+    )
+
+    assert calls["dev"] == 2, (result.state, result.result_summary)
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert "tests/test_evil.py" in result.result_summary
+
+
+@pytest.mark.asyncio
+async def test_worktree_changed_paths_reports_rename_origin(mock_git_repo):
+    """Renaming a test out of the test tree must still expose the original path."""
+    import subprocess
+
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=None,
+        reviewer_choice="glm",
+    )
+    worktree = await orchestrator.worktree_mgr.create_worktree("task_rename_paths")
+    subprocess.run(
+        ["git", "mv", "test_calc.py", "calc_helpers.py"],
+        cwd=worktree, check=True, capture_output=True,
+    )
+
+    paths = await orchestrator.worktree_mgr.get_changed_paths(worktree)
+
+    assert "test_calc.py" in paths
+    assert "calc_helpers.py" in paths
+
+
+@pytest.mark.asyncio
+async def test_resume_blocks_prior_ignored_test(mock_git_repo, test_db_session):
+    """An ignored, uncommitted test left by a paused segment must still gate the resume."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_prior_ignored"
+    worktree = await orchestrator.worktree_mgr.create_worktree(task_id)
+    (worktree / ".gitignore").write_text("tests/\n", encoding="utf-8")
+    (worktree / "tests").mkdir(exist_ok=True)
+    (worktree / "tests" / "test_prior_ignored.py").write_text(
+        "def test_prior_ignored():\n    assert True\n", encoding="utf-8"
+    )
+    await orchestrator.worktree_mgr.commit_checkpoint(worktree, "feat: pause")
+
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="prior ignored",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            worktree_path=str(worktree),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("dev agent must not run before the prior-test gate")
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=must_not_run)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.state == "WAITING_APPROVAL"
+    assert "tests/" in result.result_summary
+
+
+@pytest.mark.asyncio
+async def test_resume_blocks_prior_test_deletion(mock_git_repo, test_db_session):
+    """Deleting a test in a paused segment must not silently weaken the suite."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_deleted_test"
+    worktree = await orchestrator.worktree_mgr.create_worktree(task_id)
+    (worktree / "test_calc.py").unlink()
+    await orchestrator.worktree_mgr.commit_checkpoint(worktree, "chore: remove test")
+
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="deleted test",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            worktree_path=str(worktree),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("dev agent must not run before the prior-test gate")
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=must_not_run)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.state == "WAITING_APPROVAL"
+    assert "test_calc.py" in result.result_summary
+
+
+@pytest.mark.asyncio
+async def test_stale_approval_does_not_rewind_live_run(mock_git_repo, test_db_session):
+    """A duplicate approval must not reset a run another caller is already resuming."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_live_resume"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="live resume",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="REPAIRING",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    with pytest.raises(ValueError, match="expected 'WAITING_APPROVAL'"):
+        await orchestrator.resume_after_approval(
+            task_id=task_id, approved=True, mock_mode=False,
+        )
+
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+        assert task.state == "REPAIRING"
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_when_repair_limit_exhausted(mock_git_repo, test_db_session):
+    """Approval must not launch an over-limit paid repair attempt."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_limit_exhausted"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="limit exhausted",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+            max_repair_attempts=0,
+        ))
+        s.commit()
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("repair must not run past the configured limit")
+
+    dev_agent = SimpleNamespace(model_name="gemini-3.8-flash-high", execute=must_not_run)
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=True,
+        mock_mode=False,
+        dev_agent=dev_agent,
+    )
+
+    assert result.success is False
+    assert result.state == "FAILED"
+    assert "Repair limit already exhausted" in result.result_summary
+    assert result.repair_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_rejection_ignores_invalid_test_paths_and_stale_repo(mock_git_repo, test_db_session, tmp_path):
+    """A rejection must be able to close a run whose repo or test paths no longer resolve."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = "task_reject_stale"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="stale reject",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            repo_root=str(tmp_path / "repo-moved-away"),
+            reviewer_model="glm",
+            test_paths='["../escape.py"]',
+        ))
+        s.commit()
+
+    result = await orchestrator.resume_after_approval(
+        task_id=task_id,
+        approved=False,
+        notes="abandon",
+        mock_mode=False,
+    )
+
+    assert result.state == "FAILED"
+    assert "Rejected by human operator" in result.result_summary
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+        assert task.state == "FAILED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["REPAIRING", "TESTING", "REVIEWING"])
+async def test_interrupted_resume_states_are_restored(mock_git_repo, test_db_session, state):
+    """Any mid-flight resume state must return to WAITING_APPROVAL after a crash."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    task_id = f"task_restore_{state.lower()}"
+    with test_db_session as s:
+        s.add(Task(
+            task_id=task_id,
+            title="restore",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state=state,
+            approval_claim_id="owned",
+            repo_root=str(mock_git_repo.resolve()),
+            reviewer_model="glm",
+        ))
+        s.commit()
+
+    restored = orchestrator._restore_approval_state(task_id, False, "interrupted", claim_id="owned")
+
+    assert restored == "WAITING_APPROVAL"
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+        assert task.state == "WAITING_APPROVAL"
+
+
+def test_resume_seeds_usage_totals_from_task(mock_git_repo, test_db_session):
+    """A resumed segment reports prompt/completion/cost cumulative across segments."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+    )
+    with test_db_session as s:
+        s.add(Task(
+            task_id="task_usage_seed",
+            title="seed usage",
+            requirement="r",
+            primary_model="gemini-3.8-flash-high",
+            state="WAITING_APPROVAL",
+            total_prompt_tokens=120,
+            total_completion_tokens=45,
+            total_cost_cny=0.25,
+        ))
+        s.commit()
+
+    orchestrator._usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "cost_cny": 0.0}
+    orchestrator._seed_usage_from_task("task_usage_seed", mock_mode=False)
+    assert orchestrator._usage_total == {
+        "prompt_tokens": 120,
+        "completion_tokens": 45,
+        "cost_cny": 0.25,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reviewer_usage_is_not_double_counted(mock_git_repo, test_db_session):
+    """BudgetGuard settlement and event instrumentation must not both add reviewer usage."""
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+        max_repair_attempts=1,
+    )
+    dev_agent = GeminiDevAgent(mock_mode=True)
+    reviewer_agent = FlashReviewer(model_key="glm", mock_mode=True)
+    verdict = AgentResult(
+        success=True,
+        content="",
+        prompt_tokens=100,
+        completion_tokens=50,
+        cost_cny=0.1,
+        duration_s=0.5,
+        metadata={
+            "review": {
+                "approved": True,
+                "severity": "P3",
+                "summary": "Approved",
+                "critical_issues": [],
+                "suggestions": [],
+            }
+        },
+    )
+
+    with patch.object(reviewer_agent, "execute", return_value=verdict):
+        result = await orchestrator.run(
+            requirement="Usage accounting",
+            mock_mode=True,
+            dev_agent=dev_agent,
+            reviewer_agent=reviewer_agent,
+        )
+
+    assert result.state == "SUCCESS"
+    with test_db_session as s:
+        task = s.exec(select(Task).where(Task.task_id == result.task_id)).first()
+        assert task.total_prompt_tokens == 100
+        assert task.total_completion_tokens == 50
+        assert task.total_cost_cny == pytest.approx(0.1)
 
 
 def test_hermes_tool_registration_and_mcp_dispatch():
@@ -758,10 +1741,12 @@ async def test_hermes_slash_command_and_cli_dispatch(mock_git_repo, test_db_sess
     from plugins.agent_cooperation.commands import handle_coop_command
     from plugins.agent_cooperation.tools import get_bridge
     from integrations.hermes.mcp_server import handle_tool_call
+    import integrations.hermes.mcp_server as mcp_mod
 
     bridge = get_bridge()
     bridge.session = test_db_session
     bridge.policy.security.allowed_repos = [str(mock_git_repo)]
+    mcp_mod.BRIDGE = bridge
 
     # 1. Test /coop loop
     repo_arg = mock_git_repo.as_posix()
@@ -792,8 +1777,93 @@ def test_hermes_coop_cli_dispatch(mock_git_repo):
     register_cli(parser)
     parsed_args = parser.parse_args(["loop", "Add test via CLI", "--mock", "--repo", str(mock_git_repo)])
     assert parsed_args.coop_action == "loop"
+
+    bare_args = parser.parse_args(["Add test via CLI", "--mock", "--repo", str(mock_git_repo)])
+    assert bare_args.coop_action == "loop"
+    assert bare_args.requirement == ["Add test via CLI"]
+
+    multi_word_args = parser.parse_args(["修复", "登录", "页面", "--mock"])
+    assert multi_word_args.coop_action == "loop"
+    assert multi_word_args.requirement == ["修复", "登录", "页面"]
     cli_rc = parsed_args.func(parsed_args)
     assert cli_rc == 0
+
+
+def test_hermes_root_parser_routes_bare_requirement():
+    """The real `hermes coop <requirement>` root-parser path reaches loop mode."""
+    from plugins.agent_cooperation.cli import register_cli
+
+    root = argparse.ArgumentParser(prog="hermes")
+    root_sub = root.add_subparsers(dest="command")
+    coop_parser = root_sub.add_parser("coop")
+    register_cli(coop_parser)
+
+    parsed = root.parse_args(["coop", "Add", "root", "parser", "feature", "--mock"])
+    assert parsed.command == "coop"
+    assert parsed.coop_action == "loop"
+    assert parsed.requirement == ["Add", "root", "parser", "feature"]
+
+
+def test_hermes_cli_near_miss_typo_does_not_launch_loop():
+    """A typo like `stauts` must fail fast instead of spending budget on a loop."""
+    from plugins.agent_cooperation.cli import register_cli
+
+    parser = argparse.ArgumentParser(prog="hermes coop")
+    register_cli(parser)
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["stauts"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_slash_command_near_miss_typo_is_rejected():
+    from plugins.agent_cooperation.commands import handle_coop_command
+
+    output = await handle_coop_command("stauts")
+    assert "Unknown subcommand" in output
+    assert "Did you mean `status`?" in output
+
+
+def test_cli_loop_accepts_legacy_string_requirement(monkeypatch):
+    from plugins.agent_cooperation import cli as cli_mod
+
+    fake_bridge = SimpleNamespace(
+        run_gemini_closed_loop=AsyncMock(
+            return_value=SimpleNamespace(
+                task_id="task_legacy",
+                status="SUCCESS",
+                state="SUCCESS",
+                primary_model="gemini-3.8-flash-high",
+                total_cost_cny=0.0,
+                result_summary="",
+                error="",
+            )
+        )
+    )
+    monkeypatch.setattr(cli_mod, "get_bridge", lambda: fake_bridge)
+    args = argparse.Namespace(
+        coop_action="loop",
+        requirement="fix legacy single string",
+        repo=None,
+        title=None,
+        reviewer="glm",
+        mock=True,
+        test_paths=None,
+        max_repair=3,
+    )
+
+    assert cli_mod.coop_cli_command(args) == 0
+    assert (
+        fake_bridge.run_gemini_closed_loop.await_args.kwargs["requirement"]
+        == "fix legacy single string"
+    )
+
+
+def test_cli_strips_wrapping_quotes_from_requirement():
+    from plugins.agent_cooperation.cli import _requirement_text
+
+    assert _requirement_text('"修复 登录 页面"') == "修复 登录 页面"
+    assert _requirement_text(['"修复 登录"', '"页面"']) == "修复 登录 页面"
 
 
 def test_recursive_test_discovery(mock_git_repo):
@@ -804,5 +1874,173 @@ def test_recursive_test_discovery(mock_git_repo):
 
     paths = GeminiClosedLoopOrchestrator._test_paths(mock_git_repo, [])
     assert "tests/unit/test_nested.py" in paths
+
+
+class _CapturingDevAgent:
+    """Minimal developer agent that records its context and returns a fixed result."""
+
+    model_name = "gemini-3.8-flash-high"
+
+    def __init__(self, result: AgentResult):
+        self.result = result
+        self.contexts: list[dict] = []
+
+    async def execute(self, prompt, context=None):
+        self.contexts.append(dict(context or {}))
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_passes_repo_root_and_emits_policy_rejection_events(
+    mock_git_repo, test_db_session, tmp_path,
+):
+    """Command-policy denials must reach the run stream as non-terminal tool events."""
+    store = EventStore(tmp_path / "events")
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+        event_store=store,
+    )
+    dev_agent = _CapturingDevAgent(AgentResult(
+        success=False,
+        content="",
+        error="project command rejected",
+        metadata={
+            "policy_rejections": [
+                {
+                    "name": "run_command",
+                    "command": "npm run build && whoami",
+                    "reason": "forbidden shell fragment",
+                },
+                {
+                    "name": "run_command",
+                    "command": "python -m pytest -c evil.ini",
+                    "reason": "workspace override option",
+                },
+            ],
+        },
+    ))
+
+    result = await orchestrator.run(
+        requirement="Trigger a policy rejection",
+        mock_mode=True,
+        dev_agent=dev_agent,
+        task_id="task_policy_rejections",
+    )
+
+    assert result.success is False
+    assert dev_agent.contexts
+    assert dev_agent.contexts[0]["repo_root"] == str(mock_git_repo.resolve())
+
+    events = store.read("task_policy_rejections")
+    rejections = [
+        event for event in events
+        if event.type == "tool_result" and event.payload.get("policy_rejected") is True
+    ]
+    assert len(rejections) == 2
+    assert rejections[0].agent == "gemini"
+    assert rejections[0].phase == "develop"
+    assert rejections[0].payload["name"] == "run_command"
+    assert rejections[0].payload["succeeded"] is False
+    assert rejections[0].payload["command"] == "npm run build && whoami"
+    assert rejections[0].payload["reason"] == "forbidden shell fragment"
+    assert rejections[1].payload["command"] == "python -m pytest -c evil.ini"
+    assert events[-1].type == "result"
+    assert events[-1].payload["terminal"] is True
+
+
+def test_gemini_dev_agent_resolves_repo_scoped_and_explicit_command_policy(monkeypatch):
+    """The declared policy must follow the task repository, not the process cwd."""
+    execution = ExecutionConfig(allowed_commands={
+        "default": {"test": [["python", "-m", "pytest"]]},
+        "workplace/site": {
+            "test": [["npm", "test"]],
+            "build": [["npm", "run", "build"]],
+        },
+    })
+    monkeypatch.setattr(
+        type(settings),
+        "load_policy",
+        lambda self: SimpleNamespace(execution=execution),
+    )
+    agent = GeminiDevAgent(mock_mode=True)
+
+    resolved = agent._resolve_allowed_commands({
+        "repo_root": str(PROJECT_ROOT / "workplace/site"),
+    })
+    assert resolved == {
+        "test": [["npm", "test"]],
+        "build": [["npm", "run", "build"]],
+        "typecheck": [],
+    }
+    assert agent._resolve_allowed_commands({"repo_root": None}) == {
+        "test": [["python", "-m", "pytest"]],
+        "build": [],
+        "typecheck": [],
+    }
+    assert agent._resolve_allowed_commands({
+        "allowed_commands": {"build": [["make", "build"]]},
+    }) == {
+        "test": [],
+        "build": [["make", "build"]],
+        "typecheck": [],
+    }
+    with pytest.raises(ValueError):
+        agent._resolve_allowed_commands({"allowed_commands": {"test": [["pwsh", "-c", "whoami"]]}})
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_emits_ordered_replayable_events(mock_git_repo, test_db_session, tmp_path):
+    """Verify the closed loop publishes ordered status/output/test/usage/result events."""
+    store = EventStore(tmp_path / "events")
+    orchestrator = GeminiClosedLoopOrchestrator(
+        repo_root=mock_git_repo,
+        session=test_db_session,
+        reviewer_choice="glm",
+        max_repair_attempts=1,
+        event_store=store,
+    )
+
+    dev_agent = GeminiDevAgent(mock_mode=True)
+    reviewer_agent = FlashReviewer(model_key="glm", mock_mode=True)
+
+    result = await orchestrator.run(
+        requirement="Implement event instrumentation",
+        mock_mode=True,
+        dev_agent=dev_agent,
+        reviewer_agent=reviewer_agent,
+        task_id="task_events_test",
+    )
+
+    assert result.state == "SUCCESS"
+    events = store.read("task_events_test")
+    assert [event.seq for event in events] == list(range(1, len(events) + 1))
+    assert events[-1].type == "result"
+    assert events[-1].payload["state"] == "SUCCESS"
+    assert events[-1].payload["success"] is True
+
+    types = [event.type for event in events]
+    for expected in ("status", "output", "diff", "usage", "test_line", "result"):
+        assert expected in types, f"missing {expected} event"
+
+    states = [e.payload.get("state") for e in events if e.type == "status" and e.phase == "state"]
+    assert states[0] == "INIT"
+    assert "DEVELOPING" in states
+    assert "TESTING" in states
+    assert "REVIEWING" in states
+    assert states[-1] == "SUCCESS"
+
+    dev_output = [e for e in events if e.type == "output" and e.agent == "gemini"]
+    assert dev_output
+    assert "Simulated implementation" in dev_output[0].payload.get("text", "")
+
+    test_lines = [e.payload.get("line", "") for e in events if e.type == "test_line"]
+    assert test_lines
+    assert any("test session starts" in line or "passed" in line for line in test_lines)
+    assert all(line != "stdout" for line in test_lines)
+
+    assert events[-1].payload["prompt_tokens"] >= 0
+    assert events[-1].payload["duration_s"] > 0
 
 

@@ -93,6 +93,10 @@
           <i data-lucide="layout-dashboard" class="w-4 h-4"></i>
           <span>仪表盘概览</span>
         </button>
+        <button data-tab="run" class="tab-btn px-4 py-2 text-xs font-medium rounded-lg transition flex items-center space-x-2 text-slate-400 hover:text-slate-200 border border-transparent">
+          <i data-lucide="activity" class="w-4 h-4"></i>
+          <span>实时运行台</span>
+        </button>
         <button data-tab="tasks" class="tab-btn px-4 py-2 text-xs font-medium rounded-lg transition flex items-center space-x-2 text-slate-400 hover:text-slate-200 border border-transparent">
           <i data-lucide="list-todo" class="w-4 h-4"></i>
           <span>任务编排与历史</span>
@@ -226,6 +230,226 @@
           </div>
         </div>
 
+      </div>
+
+    </div>
+
+    <!-- TAB: 实时运行台 -->
+    <div id="tab-run" class="tab-content hidden space-y-4">
+
+      <!-- Single-input run form -->
+      <div class="p-5 rounded-2xl glass-card border border-slate-800 space-y-3">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 class="text-sm font-semibold text-slate-200">实时运行台</h2>
+            <p class="text-xs text-slate-400 mt-1">
+              直接输入需求即可启动「Gemini 研发 → 本地测试 → 独立复核」闭环；仓库、复核人与修复轮次默认自动选择。
+            </p>
+          </div>
+          <div id="runDefaultsHint" class="text-2xs text-slate-500 font-mono text-right leading-relaxed">加载默认值...</div>
+        </div>
+
+        <textarea
+          id="runRequirement"
+          rows="3"
+          placeholder="例如：给打卡页面增加补卡申请，并补充对应单元测试"
+          class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-xs text-slate-200 focus:outline-none focus:border-sky-500 font-mono resize-y"
+        ></textarea>
+
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <button type="button" onclick="RunConsole.toggleAdvanced()" class="inline-flex items-center space-x-1.5 px-3 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700">
+            <i data-lucide="settings-2" class="w-3.5 h-3.5"></i>
+            <span id="runAdvancedToggleText">高级选项</span>
+          </button>
+
+          <div class="flex items-center space-x-3">
+            <label class="flex items-center space-x-1.5 text-xs text-slate-400 cursor-pointer select-none">
+              <input type="checkbox" id="runAutoScroll" checked class="rounded bg-slate-900 border-slate-700 text-sky-500 focus:ring-0">
+              <span>自动滚动</span>
+            </label>
+            <button
+              type="button"
+              id="runSubmitBtn"
+              onclick="RunConsole.submit()"
+              class="inline-flex items-center space-x-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white shadow-lg shadow-sky-500/25 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <i data-lucide="play-circle" class="w-4 h-4"></i>
+              <span>启动闭环运行</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Advanced options -->
+        <div id="runAdvancedPanel" class="hidden grid grid-cols-1 md:grid-cols-4 gap-3 pt-3 border-t border-slate-800 text-xs">
+          <div>
+            <label class="block text-slate-400 mb-1">目标仓库 (白名单)</label>
+            <select id="runRepoSelect" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono"></select>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">独立复核模型</label>
+            <select id="runReviewerSelect" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono">
+              <option value="glm">GLM</option>
+              <option value="deepseek">DeepSeek</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">最大修复轮次</label>
+            <input id="runMaxRepair" type="number" min="0" max="10" value="3" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono">
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">测试路径 (逗号分隔，可留空)</label>
+            <input id="runTestPaths" type="text" placeholder="tests/test_student_card.py" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono">
+          </div>
+        </div>
+
+        <div id="runError" class="hidden p-2.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-rose-300 text-xs"></div>
+      </div>
+
+      <!-- Active run header + metrics -->
+      <div id="runActivePanel" class="hidden p-4 rounded-2xl glass-card border border-slate-800 space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span id="runConnectionDot" class="pulse-indicator bg-sky-500"></span>
+            <span id="runTaskId" class="font-mono text-xs text-sky-300">-</span>
+            <span id="runStateBadge"></span>
+            <span id="runModeBadge" class="px-2 py-0.5 text-2xs font-mono rounded bg-slate-800 text-slate-400 border border-slate-700">MOCK</span>
+            <span id="runReplayBadge" class="hidden px-2 py-0.5 text-2xs font-mono rounded bg-purple-500/20 text-purple-300 border border-purple-500/30">回放</span>
+          </div>
+          <div class="flex flex-wrap items-center gap-4 text-xs font-mono">
+            <span class="text-slate-400">耗时 <span id="runDuration" class="text-slate-100">0.0s</span></span>
+            <span class="text-slate-400">费用 <span id="runCost" class="text-amber-400">¥0.00000</span></span>
+            <span class="text-slate-400">Token <span id="runTokens" class="text-purple-300">0</span></span>
+            <span class="text-slate-400">修复 <span id="runRepairs" class="text-sky-300">0</span></span>
+            <button onclick="RunConsole.clearPanes()" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">清空面板</button>
+          </div>
+        </div>
+        <div id="runApprovalBanner" class="hidden p-3 rounded-xl bg-amber-950/40 border border-amber-700/60 space-y-2">
+          <div class="flex items-start space-x-2 text-amber-200 text-xs">
+            <i data-lucide="shield-alert" class="w-4 h-4 mt-0.5 shrink-0"></i>
+            <div id="runApprovalText" class="whitespace-pre-wrap"></div>
+          </div>
+          <textarea
+            id="runApprovalNotes"
+            rows="2"
+            placeholder="审批备注（可选，将写入审批记录并作为修复指令传给研发 Agent）"
+            class="w-full bg-slate-950 border border-amber-800/60 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500 resize-y"
+          ></textarea>
+          <label id="runApprovalAllowTestsRow" class="flex items-start space-x-2 text-2xs text-amber-200/90">
+            <input id="runApprovalAllowTests" type="checkbox" class="mt-0.5 accent-amber-500" />
+            <span>允许本次修复执行新生成或修改的测试文件（仅在已确认测试内容安全时勾选）</span>
+          </label>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <span class="text-2xs text-amber-300/80">
+              <span id="runApprovalReplayNote" class="hidden">历史回放：该运行已结束，审批操作不可用</span>
+              <span id="runApprovalStatus"></span>
+            </span>
+            <div id="runApprovalActions" class="flex items-center space-x-2">
+              <button
+                type="button"
+                id="runRejectBtn"
+                onclick="RunConsole.decideApproval(false)"
+                class="px-3 py-1.5 text-xs rounded-lg bg-rose-600/80 hover:bg-rose-500 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+              >拒绝</button>
+              <button
+                type="button"
+                id="runApproveBtn"
+                onclick="RunConsole.decideApproval(true)"
+                class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+              >批准并继续</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live panes -->
+      <div id="runLiveGrid" class="hidden grid grid-cols-1 xl:grid-cols-3 gap-4">
+
+        <!-- Agent output -->
+        <div class="xl:col-span-2 rounded-2xl glass-card border border-slate-800 overflow-hidden flex flex-col min-h-[420px]">
+          <div class="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between">
+            <div class="flex items-center space-x-2">
+              <i data-lucide="terminal" class="w-4 h-4 text-sky-400"></i>
+              <h3 class="text-xs font-semibold text-slate-200">Agent 实时输出</h3>
+              <span id="runAgentLegend" class="text-2xs text-slate-500 font-mono"></span>
+            </div>
+            <span class="text-2xs text-slate-500 font-mono">output · tool · test_line</span>
+          </div>
+          <div id="runOutputPane" class="run-stream flex-1 overflow-y-auto p-3 space-y-1 font-mono text-xs"></div>
+        </div>
+
+        <!-- Timeline + diff -->
+        <div class="space-y-4 flex flex-col">
+          <div class="rounded-2xl glass-card border border-slate-800 overflow-hidden flex-1 min-h-[200px]">
+            <div class="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between">
+              <div class="flex items-center space-x-2">
+                <i data-lucide="git-branch" class="w-4 h-4 text-purple-400"></i>
+                <h3 class="text-xs font-semibold text-slate-200">步骤时间线</h3>
+              </div>
+              <span class="text-2xs text-slate-500 font-mono">status</span>
+            </div>
+            <div id="runTimeline" class="p-3 space-y-1.5 max-h-[260px] overflow-y-auto text-xs"></div>
+          </div>
+
+          <div class="rounded-2xl glass-card border border-slate-800 overflow-hidden flex-1 min-h-[200px]">
+            <div class="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between">
+              <div class="flex items-center space-x-2 shrink-0">
+                <i data-lucide="file-diff" class="w-4 h-4 text-emerald-400"></i>
+                <h3 class="text-xs font-semibold text-slate-200 whitespace-nowrap">文件变更预览</h3>
+              </div>
+              <span id="runDiffMeta" class="text-2xs text-slate-500 font-mono truncate text-right ml-2">等待 diff</span>
+            </div>
+            <pre id="runDiffPane" class="run-diff m-0 p-3 text-2xs leading-relaxed overflow-auto max-h-[260px]"></pre>
+          </div>
+
+          <div class="rounded-2xl glass-card border border-slate-800 overflow-hidden">
+            <div class="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between">
+              <div class="flex items-center space-x-2">
+                <i data-lucide="clipboard-check" class="w-4 h-4 text-teal-400"></i>
+                <h3 class="text-xs font-semibold text-slate-200">证据摘要</h3>
+              </div>
+              <span id="runEvidenceMeta" class="text-2xs text-slate-500 font-mono">等待证据</span>
+            </div>
+            <dl id="runEvidenceBody" class="p-3 grid grid-cols-2 gap-x-3 gap-y-2 text-2xs"></dl>
+          </div>
+        </div>
+      </div>
+
+      <!-- History -->
+      <div class="space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <h3 class="text-sm font-semibold text-slate-200">最近运行（最多 50 条，可回放）</h3>
+          <div class="flex items-center space-x-3">
+            <select
+              id="runHistoryRepo"
+              onchange="RunConsole.loadHistory()"
+              class="bg-slate-900 border border-slate-700 text-xs text-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-sky-500 max-w-[220px] truncate"
+            >
+              <option value="">全部仓库</option>
+            </select>
+            <button onclick="RunConsole.loadHistory()" class="text-xs text-sky-400 hover:underline">刷新列表</button>
+          </div>
+        </div>
+        <div class="rounded-xl glass-card border border-slate-800 overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-900/80 border-b border-slate-800 text-slate-400 font-mono uppercase">
+                <tr>
+                  <th class="p-3">Task ID</th>
+                  <th class="p-3">需求标题</th>
+                  <th class="p-3">仓库</th>
+                  <th class="p-3">状态</th>
+                  <th class="p-3">复核</th>
+                  <th class="p-3">修复</th>
+                  <th class="p-3">费用</th>
+                  <th class="p-3">时间</th>
+                </tr>
+              </thead>
+              <tbody id="runHistoryBody">
+                <tr><td colspan="8" class="p-8 text-center text-slate-500">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
     </div>
@@ -643,6 +867,7 @@
 
   <!-- Initialize Application -->
   <script src="/static/js/codex_recovery.js"></script>
+  <script src="/static/js/run_console.js"></script>
   <script src="/static/js/app.js"></script>
   <script>
     document.addEventListener('DOMContentLoaded', () => {

@@ -1,7 +1,38 @@
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from execution.subproc import run_async_command
+
+
+@dataclass
+class WorktreeStatusProbe:
+    """Snapshot of a task worktree's state, used for timeout idempotency and state confirmation."""
+    worktree_path: Path
+    base_ref: str
+    head_sha: str
+    commits_ahead: int
+    is_clean: bool
+    staged_files: list[str] = field(default_factory=list)
+    unstaged_files: list[str] = field(default_factory=list)
+    untracked_files: list[str] = field(default_factory=list)
+    has_meaningful_work: bool = False
+    summary: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worktree_path": str(self.worktree_path),
+            "base_ref": self.base_ref,
+            "head_sha": self.head_sha,
+            "commits_ahead": self.commits_ahead,
+            "is_clean": self.is_clean,
+            "staged_files": list(self.staged_files),
+            "unstaged_files": list(self.unstaged_files),
+            "untracked_files": list(self.untracked_files),
+            "has_meaningful_work": self.has_meaningful_work,
+            "summary": self.summary,
+        }
 
 
 class WorktreeManager:
@@ -122,3 +153,109 @@ class WorktreeManager:
         path = await self._validate_worktree(worktree_path)
         status = await self._git(["status", "--porcelain"], path)
         return not bool(status.strip())
+
+    async def get_changed_paths_since(self, worktree_path: Path, base_ref: str) -> list[str]:
+        """Return every path changed between the fixed base and HEAD, including deletions."""
+        path = await self._validate_worktree(worktree_path)
+        if not re.fullmatch(r"[a-fA-F0-9]{40,64}", base_ref):
+            raise ValueError("Changed paths require a fixed base commit SHA")
+        res = await run_async_command(
+            ["git", "diff", "--name-only", "-z", "--no-renames", base_ref, "HEAD", "--"],
+            cwd=path,
+        )
+        if not res.is_success:
+            raise RuntimeError(f"Git diff failed: {res.stderr.strip()}")
+        return sorted({entry for entry in res.stdout.split("\0") if entry})
+
+    async def get_changed_paths(self, worktree_path: Path, *, include_ignored: bool = False) -> list[str]:
+        """Return staged, unstaged and untracked paths relative to the worktree."""
+        path = await self._validate_worktree(worktree_path)
+        cmd = ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+        if include_ignored:
+            cmd.append("--ignored=matching")
+        res = await run_async_command(cmd, cwd=path)
+        if not res.is_success:
+            raise RuntimeError(f"Git status failed: {res.stderr.strip()}")
+        entries = res.stdout.split("\0")
+        paths: set[str] = set()
+        index = 0
+        while index < len(entries):
+            entry = entries[index]
+            index += 1
+            if len(entry) < 4:
+                continue
+            status_code = entry[:2]
+            paths.add(entry[3:])
+            if "R" in status_code or "C" in status_code:
+                if index < len(entries) and entries[index]:
+                    paths.add(entries[index])  # original path follows for renames/copies
+                index += 1
+        return sorted(paths)
+
+    async def probe_worktree_status(self, worktree_path: Path, base_ref: str | None = None) -> WorktreeStatusProbe:
+        """Probe the worktree state to verify commits, uncommitted changes, and active progress."""
+        path = await self._validate_worktree(worktree_path)
+        base = base_ref or await self.get_base_ref(path)
+        head = await self._git(["rev-parse", "HEAD"], path)
+
+        count_str = await self._git(["rev-list", "--count", f"{base}..HEAD"], path)
+        try:
+            commits_ahead = int(count_str.strip())
+        except ValueError:
+            commits_ahead = 0
+
+        status_res = await run_async_command(["git", "status", "--porcelain=v1"], cwd=path)
+        if not status_res.is_success:
+            raise RuntimeError(f"Git status failed: {status_res.stderr.strip()}")
+        status_raw = status_res.stdout
+        staged: list[str] = []
+        unstaged: list[str] = []
+        untracked: list[str] = []
+
+        for line in status_raw.splitlines():
+            if not line.strip():
+                continue
+            if line.startswith("??"):
+                untracked.append(line[3:].strip())
+            else:
+                x = line[0] if len(line) > 0 else " "
+                y = line[1] if len(line) > 1 else " "
+                fname = line[2:].strip() if len(line) > 2 else ""
+                if x not in (" ", "?"):
+                    staged.append(fname)
+                if y not in (" ", "?"):
+                    unstaged.append(fname)
+
+        is_clean = len(staged) == 0 and len(unstaged) == 0 and len(untracked) == 0
+        has_meaningful_work = (
+            commits_ahead > 0
+            or len(staged) > 0
+            or len(unstaged) > 0
+            or any(f.endswith(".py") or f.endswith(".json") or f.endswith(".md") for f in untracked)
+        )
+
+        if commits_ahead > 0:
+            summary = (
+                f"Task produced {commits_ahead} commit(s) ahead of base ({head[:8]}); "
+                f"working tree {'clean' if is_clean else 'dirty'}."
+            )
+        elif has_meaningful_work:
+            summary = (
+                f"No commits created yet, but working tree has active work "
+                f"({len(staged)} staged, {len(unstaged)} unstaged, {len(untracked)} untracked files)."
+            )
+        else:
+            summary = "No commits or file modifications detected in worktree."
+
+        return WorktreeStatusProbe(
+            worktree_path=path,
+            base_ref=base,
+            head_sha=head,
+            commits_ahead=commits_ahead,
+            is_clean=is_clean,
+            staged_files=staged,
+            unstaged_files=unstaged,
+            untracked_files=untracked,
+            has_meaningful_work=has_meaningful_work,
+            summary=summary,
+        )

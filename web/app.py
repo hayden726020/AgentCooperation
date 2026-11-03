@@ -1,12 +1,26 @@
 """Web Console application factory and server entrypoint."""
 
 import argparse
+import ipaddress
 import sys
 from pathlib import Path
-from flask import Flask, render_template, jsonify
+from urllib.parse import urlsplit
+from flask import Flask, render_template, jsonify, request
 
 from config.settings import settings
 from web.api import api_bp
+
+
+def _origin_tuple(value):
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+            return None
+        return parsed.scheme, parsed.hostname.lower(), parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
 
 
 def create_app(mock_default: bool = False) -> Flask:
@@ -20,6 +34,28 @@ def create_app(mock_default: bool = False) -> Flask:
     )
     app.config["MOCK_DEFAULT"] = mock_default
     app.config["JSON_AS_ASCII"] = False
+
+    # REMOTE_ADDR is the direct peer, not an authentication mechanism. Never
+    # expose this app through an unauthenticated local reverse proxy: such a
+    # proxy makes remote clients appear to originate on loopback.
+    @app.before_request
+    def enforce_web_boundary():
+        current = _origin_tuple(request.host_url)
+        if current is None or current[1] not in {"localhost", "127.0.0.1", "::1"}:
+            return jsonify({"error": "Untrusted host"}), 403
+        try:
+            peer = ipaddress.ip_address(request.remote_addr or "")
+            if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+                peer = peer.ipv4_mapped
+            loopback = peer.is_loopback
+        except ValueError:
+            loopback = False
+        if not loopback:
+            return jsonify({"error": "Remote access is not permitted"}), 403
+        origin = request.headers.get("Origin")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and origin is not None:
+            if _origin_tuple(origin) != current or _origin_tuple(origin) is None:
+                return jsonify({"error": "Cross-origin request is not allowed"}), 403
 
     # Register API blueprint
     app.register_blueprint(api_bp)

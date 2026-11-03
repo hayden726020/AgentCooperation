@@ -142,11 +142,14 @@ def provider_context(tmp_path, monkeypatch):
         reset_hermes_home_override(token)
 
 
-def project_client(profile, workspace: Path):
+def project_client(profile, workspace: Path, allowed_commands=None):
+    project_execution = {"enabled": True, "workspace": str(workspace.resolve())}
+    if allowed_commands is not None:
+        project_execution["allowed_commands"] = allowed_commands
     return profile.create_client(
         subscription_bridge_enabled=True,
         native_agent="hermes-project-dev",
-        project_execution={"enabled": True, "workspace": str(workspace.resolve())},
+        project_execution=project_execution,
     )
 
 
@@ -226,18 +229,47 @@ def test_non_boolean_project_opt_in_remains_disabled(provider_context):
     assert Path(spawn.call_args.kwargs["cwd"]).is_relative_to(profile_home)
 
 
-def test_project_execution_rejects_custom_command_policy(provider_context):
+CUSTOM_POLICY = {
+    "test": [["python", "-m", "pytest"]],
+    "build": [["npm", "run", "build"]],
+    "typecheck": [["npx", "tsc", "--noEmit"]],
+}
+
+
+def test_project_execution_accepts_declared_command_categories(provider_context):
+    profile, module, _, workspace = provider_context
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([init_event(workspace, client.native_agent), result_event()])
+    try:
+        _, spawn = invoke(client, module, process)
+    finally:
+        client.close()
+
+    native_home = Path(spawn.call_args.kwargs["env"]["HOME"])
+    settings = json.loads(
+        (native_home / ".gemini/antigravity-cli/settings.json").read_text(encoding="utf-8")
+    )
+    allow = set(settings["permissions"]["allow"])
+    for argv in ("python -m pytest", "npm run build", "npx tsc --noEmit"):
+        assert f"command({argv}*)" in allow
+        assert f"unsandboxed({argv}*)" in allow
+
+
+@pytest.mark.parametrize("allowed_commands", [
+    ["pwsh"],
+    {"test": [["pwsh", "-Command", "whoami"]]},
+    {"test": [["bash", "-lc", "whoami"]]},
+    {"test": [["python", "-m", "pytest", "../outside"]]},
+    {"test": [["python", "-m", "pytest", ".env"]]},
+    {"test": [["python", "-m", "pytest", "--rootdir=.."]]},
+    {"test": [["python"]]},
+    {"lint": [["npm", "run", "lint"]]},
+    {"test": "python -m pytest"},
+])
+def test_project_execution_rejects_unsafe_or_unknown_command_policies(provider_context, allowed_commands):
     profile, _, _, workspace = provider_context
-    with pytest.raises(ValueError, match="(?i)command|fixed|project"):
-        profile.create_client(
-            subscription_bridge_enabled=True,
-            native_agent="hermes-project-dev",
-            project_execution={
-                "enabled": True,
-                "workspace": str(workspace.resolve()),
-                "allowed_commands": ["pwsh"],
-            },
-        )
+    with pytest.raises(ValueError, match="(?i)allowed_commands|mapping|shell|unsafe|category|list|argument"):
+        project_client(profile, workspace, allowed_commands)
 
 
 def test_effective_profile_configuration_enables_fixed_project_workspace(provider_context):
@@ -558,6 +590,310 @@ def test_project_command_tool_rejects_non_allowlisted_or_injected_commands(provi
     ])
     try:
         with pytest.raises((RuntimeError, ValueError, PermissionError), match="(?i)command|allow|denied|shell"):
+            invoke(client, module, process)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("command", [
+    "python -m pytest tests/test_module.py -q",
+    "npm run build",
+    "npm run build -- --prod",
+    "npx tsc --noEmit",
+])
+def test_declared_test_build_and_typecheck_commands_are_accepted(provider_context, command):
+    profile, module, _, workspace = provider_context
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([
+        init_event(workspace, client.native_agent),
+        tool_event("run_command", {"CommandLine": command, "Cwd": str(workspace)}),
+        result_event("declared command accepted"),
+    ])
+    try:
+        response, _ = invoke(client, module, process)
+    finally:
+        client.close()
+    assert response.choices[0].message.content == "declared command accepted"
+
+
+@pytest.mark.parametrize("command", [
+    "npm install",
+    "npm install --global left-pad",
+    "npm run test",
+    "npm run build && whoami",
+    "npm run build; whoami",
+    "npm run build | tee out.txt",
+    "npm run build > out.txt",
+    "npm run build `whoami`",
+    "npm run build --prefix=../outside",
+    "npm run build --prefix=src",
+    "npm run build --script-shell=pwsh",
+    "npm run build --workspace=other",
+    "npm run build -- --config=../outside",
+    "npx tsc --noEmit --package=evil",
+    "npx tsc --noEmit --call=whoami",
+    "npx tsc --noEmit ../outside",
+    "npx tsc --noEmit .env",
+    "npx tsc --noEmit C:/outside",
+    "npx tsc --noEmit /etc/passwd",
+    "npx tsc --noEmit @file",
+    "python -m pytest -qc evil.ini",
+    "python -m pytest -qo addopts=x",
+    "python -m pytest -qoc addopts=x",
+    "python -m pytest -c evil.ini",
+    "python -m pytest --config-file evil.ini",
+    "python -m pytest -o addopts=--whoami",
+    "npm run build -w other",
+    "npm run build -g",
+    "python -m pytest --rootdir=..",
+    "python -m pytest --confcutdir=..",
+    "python -m pytest --basetemp=../tmp",
+    "python -m pytest --pyargs outside",
+    "python -m pytest --override-ini=x=y",
+    "bash -lc 'npm run build'",
+    "pwsh -Command npm",
+])
+def test_declared_policy_still_rejects_injection_and_escapes(provider_context, command):
+    profile, module, _, workspace = provider_context
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([
+        init_event(workspace, client.native_agent),
+        tool_event("run_command", {"CommandLine": command, "Cwd": str(workspace)}),
+        result_event(),
+    ])
+    try:
+        with pytest.raises((RuntimeError, ValueError, PermissionError), match="(?i)command|allow|denied|shell|argument|workspace"):
+            invoke(client, module, process)
+    finally:
+        client.close()
+
+
+def test_declared_commands_require_the_workspace_root_as_cwd(provider_context):
+    profile, module, _, workspace = provider_context
+    subdir = workspace / "src"
+    subdir.mkdir()
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([
+        init_event(workspace, client.native_agent),
+        tool_event("run_command", {"CommandLine": "npm run build", "Cwd": str(subdir)}),
+        result_event(),
+    ])
+    try:
+        with pytest.raises((RuntimeError, ValueError, PermissionError), match="(?i)workspace root|working|command"):
+            invoke(client, module, process)
+    finally:
+        client.close()
+
+
+def test_pretool_hook_uses_declared_policy_and_audits_denials(provider_context):
+    profile, module, _, workspace = provider_context
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([init_event(workspace, client.native_agent), result_event()])
+    try:
+        _, spawn = invoke(client, module, process)
+    finally:
+        client.close()
+
+    native_home = Path(spawn.call_args.kwargs["env"]["HOME"])
+    validator = native_home / "hermes-project-policy.py"
+    subdir = workspace / "src"
+    subdir.mkdir(exist_ok=True)
+
+    cases = [
+        ("run_command", "allow", {"CommandLine": "npm run build", "Cwd": str(workspace)}),
+        ("run_command", "allow", {"CommandLine": "npx tsc --noEmit", "Cwd": str(workspace)}),
+        ("run_command", "allow", {"CommandLine": "python -m pytest tests/test_module.py -q", "Cwd": str(workspace)}),
+        ("run_command", "allow", {"CommandLine": "python -m pytest tests/test_module.py -q -k slow", "Cwd": str(workspace)}),
+        ("run_command", "allow", {"command": "npm run build", "cwd": str(workspace)}),
+        ("view_file", "allow", {"absolutepath": str(workspace / "src/module.py")}),
+        ("run_command", "deny", {"CommandLine": "npm install", "Cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "npm run build && whoami", "Cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "python -m pytest -c evil.ini", "Cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "python -m pytest -qc evil.ini", "Cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "npm run build -w other", "Cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "npx tsc --noEmit ../outside", "Cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "python -m pytest --basetemp=../tmp", "Cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "npm run build", "Cwd": str(subdir)}),
+        ("run_command", "deny", {"command": "npm install", "cwd": str(workspace)}),
+        ("run_command", "deny", {"CommandLine": "npm run build", "CWD": "../outside"}),
+        ("run_command", "deny", {"CommandLine": "npm run build", "Cwd": str(workspace), "cwd": ".."}),
+        ("view_file", "deny", {"absolutepath": "../outside/module.py"}),
+        ("view_file", "deny", {"AbsolutePath": str(workspace / "a.py"), "absolutepath": "../outside/b.py"}),
+    ]
+    denied_commands = []
+    for name, expected, arguments in cases:
+        completed = subprocess.run(
+            [sys.executable, str(validator)],
+            input=json.dumps({"toolCall": {"name": name, "args": arguments}}),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        decision = json.loads(completed.stdout)
+        assert decision["decision"] == expected, arguments
+        if expected == "deny" and name == "run_command":
+            denied_commands.append(arguments.get("CommandLine", arguments.get("command")))
+
+    audit_path = native_home / "policy-audit.jsonl"
+    with audit_path.open("a", encoding="utf-8") as handle:
+        handle.write("not json\n")
+        handle.write(json.dumps(["ignored"]) + "\n")
+    records = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and line.startswith("{")
+    ]
+    assert len(records) == len(denied_commands) + 2
+    assert [record["command"] for record in records[:len(denied_commands)]] == denied_commands
+    for record in records[:len(denied_commands)]:
+        assert record["tool"] == "run_command"
+        assert record["reason"]
+        assert record["timestamp"]
+    assert [record["tool"] for record in records[-2:]] == ["view_file", "view_file"]
+
+    rejections = client.read_policy_audit()
+    assert len(rejections) == len(denied_commands) + 2
+    assert [item["command"] for item in rejections[:len(denied_commands)]] == denied_commands
+    assert all(item["name"] == "run_command" for item in rejections[:len(denied_commands)])
+    assert [item["name"] for item in rejections[-2:]] == ["view_file", "view_file"]
+    assert all(item["command"] is None for item in rejections[-2:])
+    assert all(item["succeeded"] is False and item["policy_rejected"] is True for item in rejections)
+    assert all(item["reason"] and item["timestamp"] for item in rejections)
+
+
+@pytest.mark.parametrize(("mode", "command"), [("path", "python -m pytest"), ("cwd", "git status")])
+def test_pretool_hook_rejects_executables_shadowed_from_the_workspace(provider_context, mode, command):
+    profile, module, _, workspace = provider_context
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([init_event(workspace, client.native_agent), result_event()])
+    try:
+        _, spawn = invoke(client, module, process)
+    finally:
+        client.close()
+
+    native_home = Path(spawn.call_args.kwargs["env"]["HOME"])
+    validator = native_home / "hermes-project-policy.py"
+    executable = "python" if mode == "path" else "git"
+    shadow_name = f"{executable}.exe" if os.name == "nt" else executable
+    env = dict(os.environ)
+    if mode == "path":
+        bin_dir = workspace / "bin"
+        bin_dir.mkdir()
+        (bin_dir / shadow_name).write_text("", encoding="utf-8")
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    else:
+        (workspace / shadow_name).write_text("", encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(validator)],
+        input=json.dumps({
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": command, "Cwd": str(workspace)},
+            },
+        }),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+        env=env,
+    )
+    decision = json.loads(completed.stdout)
+    assert decision["decision"] == "deny", command
+    assert "shadow" in decision["reason"].lower()
+
+
+@pytest.mark.parametrize("mode", ["path", "cwd"])
+def test_runtime_rejects_executables_shadowed_from_the_workspace(provider_context, monkeypatch, mode):
+    profile, module, _, workspace = provider_context
+    shadow_name = "python.exe" if os.name == "nt" else "python"
+    if mode == "path":
+        bin_dir = workspace / "bin"
+        bin_dir.mkdir()
+        shadow = bin_dir / shadow_name
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    else:
+        shadow = workspace / shadow_name
+    shadow.write_text("", encoding="utf-8")
+    if os.name != "nt":
+        shadow.chmod(0o755)
+
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([
+        init_event(workspace, client.native_agent),
+        tool_event("run_command", {"command": "python -m pytest", "cwd": str(workspace)}),
+        result_event(),
+    ])
+    try:
+        with pytest.raises((RuntimeError, ValueError, PermissionError), match="(?i)shadow|executable"):
+            invoke(client, module, process)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("arguments", [
+    {"CommandLine": "python -m pytest", "CWD": ".."},
+    {"CommandLine": "python -m pytest", "Cwd": "<workspace>", "cwd": ".."},
+    {"command": "python -m pytest", "cWd": ".git"},
+])
+def test_runtime_rejects_case_variant_or_ambiguous_working_directory(provider_context, arguments):
+    profile, module, _, workspace = provider_context
+    payload = {
+        key: (str(workspace) if value == "<workspace>" else value)
+        for key, value in arguments.items()
+    }
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([
+        init_event(workspace, client.native_agent),
+        tool_event("run_command", payload),
+        result_event(),
+    ])
+    try:
+        with pytest.raises((RuntimeError, ValueError, PermissionError),
+                           match="(?i)ambiguous|traversal|workspace|working|protected"):
+            invoke(client, module, process)
+    finally:
+        client.close()
+
+
+def _tamper_grant_surface(settings_path: Path, surface: str) -> None:
+    native_home = settings_path.parents[2]
+    project_path = native_home / ".gemini/config/projects/default-cli-project.json"
+    config_path = native_home / ".gemini/config/config.json"
+    if surface == "project_missing":
+        project_path.unlink()
+        return
+    if surface == "project_workspace":
+        data = json.loads(project_path.read_text(encoding="utf-8"))
+        data["projectResources"]["resources"] = [{"folderUri": (native_home / "elsewhere").as_uri()}]
+        project_path.write_text(json.dumps(data), encoding="utf-8")
+        return
+    target = project_path if surface == "project_allow" else config_path
+    data = json.loads(target.read_text(encoding="utf-8"))
+    if surface == "project_allow":
+        grants = data["permissionGrants"]["permissionGrants"]
+    else:
+        grants = data["userSettings"]["globalPermissionGrants"]
+    grants["allow"].append("command(rm -rf *)")
+    target.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize("surface", ["project_allow", "project_workspace", "project_missing", "global_allow"])
+def test_project_and_global_grant_surfaces_are_reverified(provider_context, monkeypatch, surface):
+    profile, module, _, workspace = provider_context
+    original = module.create_project_request_scope
+
+    def scope(cache_root, agent_name, execution):
+        result = original(cache_root, agent_name, execution)
+        _tamper_grant_surface(result[1], surface)
+        return result
+
+    monkeypatch.setattr(module, "create_project_request_scope", scope)
+    client = project_client(profile, workspace, CUSTOM_POLICY)
+    process = FakeProcess([init_event(workspace, client.native_agent), result_event()])
+    try:
+        with pytest.raises((RuntimeError, ValueError), match="(?i)policy|workspace|removed|changed"):
             invoke(client, module, process)
     finally:
         client.close()

@@ -28,6 +28,9 @@ const App = {
         if (window.CodexRecovery) {
           window.CodexRecovery.onModeChange();
         }
+        if (window.RunConsole) {
+          window.RunConsole.onModeChange();
+        }
         this.refreshCurrentTab();
       });
     }
@@ -42,6 +45,9 @@ const App = {
 
     if (window.CodexRecovery) {
       window.CodexRecovery.init();
+    }
+    if (window.RunConsole) {
+      window.RunConsole.init();
     }
 
     this.setupTabs();
@@ -124,6 +130,10 @@ const App = {
         await this.loadTasks(mockParam);
       } else if (this.state.currentTab === 'multica') {
         await this.loadMulticaBoard();
+      } else if (this.state.currentTab === 'run') {
+        if (window.RunConsole) {
+          await window.RunConsole.refresh();
+        }
       } else if (this.state.currentTab === 'codex') {
         await this.loadCodexCenter(mockParam, isBackground);
       } else if (this.state.currentTab === 'budget') {
@@ -667,12 +677,12 @@ const App = {
       REPAIRING: 'badge-warning',
       ESCALATING: 'badge-warning',
       CODEX_BACKLOGGED: 'badge-warning',
-      WAITING_APPROVAL: 'badge-failed',
+      WAITING_APPROVAL: 'badge-warning',
       BUDGET_STOPPED: 'badge-failed',
       INIT: 'bg-slate-800 text-slate-400',
     };
     const cls = map[state] || 'bg-slate-800 text-slate-400';
-    return `<span class="px-2 py-0.5 text-xs rounded font-mono font-medium ${cls}">${state}</span>`;
+    return `<span class="px-2 py-0.5 text-xs rounded font-mono font-medium ${cls}">${this.escapeHtml(state ?? '')}</span>`;
   },
 
   formatDate(isoStr) {

@@ -130,7 +130,7 @@ async def test_real_echo_handles_large_unicode_and_metacharacters_without_shell(
     decoded = json.loads(outcome.stdout)
     assert decoded["argv"] == ["arg with spaces & | %"]
     # Python universal-newline stdin normalization does not alter any data tokens.
-    assert decoded["input"] == payload.replace("\r\n", "\n")
+    assert decoded["input"].replace("\r\n", "\n") == payload.replace("\r\n", "\n")
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,8 @@
 # AgentCooperation 工作指南
 
 - 默认使用中文。保留用户已有改动，遵循会话中的授权和全局 ECC 规则；复杂任务按领域委派，代码改动安排独立复核。
-- 首先按需阅读 `docs/CONTEXT.md`，再读取任务涉及的模块；不要预加载历史报告或完整第三方仓库。
+- **强制执行核心技能规范**：所有任务严格执行 8 大核心技能（`gsd-workflow` 驱动流程与质量、`context-degradation` 衰减排毒、`context-compression` 状态沉淀、`context-optimization` 渐进加载、`memory-systems` 记忆持久化、`filesystem-context` 物理隔离、`multiagent-patterns` 协同防污染、`serena-retrieval` 符号检索）。
+- 首先按需阅读 `docs/CONTEXT.md` 与 `.planning/STATE.md`，再读取任务涉及的模块；不要预加载历史报告或完整第三方仓库。
 - 主项目：`agents/`、`config/`、`execution/`、`orchestrator/`、`storage/`、`integrations/`、`web/`、`tests/`、`scripts/`。
 - `hermes-agent/`、`DeepSeekBot/` 是独立本地仓库，`references/` 是参考子模块。只有任务涉及它们时才定向检查，并遵守各自规则。
 - 自动流水线的单任务 GLM / DeepSeek 二选一规则仍有效；手动 Hermes Bot 的角色配置是另一入口。未经用户指示不迁移角色。

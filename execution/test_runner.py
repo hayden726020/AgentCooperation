@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from execution.subproc import run_async_command
+from execution.subproc import LineCallback, run_async_command
 
 
 @dataclass
@@ -137,14 +137,20 @@ class TestRunner:
             env.pop(proxy_var, None)
         return env
 
-    async def run(self, timeout: float = 120.0) -> TestResult:
+    async def run(self, timeout: float = 120.0, on_line: Optional[LineCallback] = None) -> TestResult:
         try:
             cmd = self.detect_command()
         except ValueError as exc:
             return TestResult(False, 0, 0, str(exc), str(exc), 0)
 
         hardened_env = self.build_env(self.worktree_path)
-        res = await run_async_command(cmd=cmd, cwd=self.worktree_path, env=hardened_env, timeout=timeout)
+        res = await run_async_command(
+            cmd=cmd,
+            cwd=self.worktree_path,
+            env=hardened_env,
+            timeout=timeout,
+            on_line=on_line,
+        )
         output = f"{res.stdout}\n{res.stderr}".strip()
         counts = {}
         for line in reversed(output.splitlines()):

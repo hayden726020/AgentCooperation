@@ -16,6 +16,7 @@ class Task(SQLModel, table=True):
     requirement: str
     primary_model: str = "glm"  # "glm" 或 "deepseek" (互斥单模型)
     state: str = "PENDING"
+    approval_claim_id: Optional[str] = None
     branch_name: str = ""
     worktree_path: str = ""
     repair_attempts: int = 0
@@ -28,6 +29,8 @@ class Task(SQLModel, table=True):
     commit_sha: Optional[str] = None
     mock_mode: bool = False
     reviewer_model: Optional[str] = None
+    max_repair_attempts: Optional[int] = None
+    test_paths: Optional[str] = None
     test_passed: Optional[bool] = None
     repo_root: Optional[str] = None
     base_ref: Optional[str] = None

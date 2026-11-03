@@ -18,6 +18,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -528,9 +529,20 @@ async def test_coop_slash_commands(hermes_test_env):
     pending_out = await handle_coop_command("pending")
     assert "Pending Actions" in pending_out
 
-    # 4. Unknown subcommand
-    unknown_out = await handle_coop_command("nonexistent_subcmd")
-    assert "Unknown subcommand" in unknown_out
+    # 4. Bare requirement text defaults to the closed loop
+    bridge.run_gemini_closed_loop = AsyncMock(return_value=SimpleNamespace(model_dump=lambda: {
+        "task_id": "task_bare",
+        "title": "nonexistent_subcmd",
+        "status": "SUCCESS",
+        "state": "SUCCESS",
+        "primary_model": "gemini-3.8-flash-high",
+        "branch_name": "test",
+        "repair_attempts": 0,
+        "total_cost_cny": 0.0,
+    }))
+    bare_out = await handle_coop_command("nonexistent_subcmd")
+    assert "Task:" in bare_out
+    assert bridge.run_gemini_closed_loop.await_args.kwargs["requirement"] == "nonexistent_subcmd"
 
 
 def test_coop_cli_commands(hermes_test_env, capsys):

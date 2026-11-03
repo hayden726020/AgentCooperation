@@ -37,6 +37,10 @@
    - `providers.gemini.enabled: false`，即使系统环境变量存在 `GEMINI_API_KEY`，Hermes 的 provider guard 也会在网络传输前直接拦截，禁止隐式计费兜底。
 6. **子进程生命周期管理**：
    - 超时（默认 300s）或用户取消时，采用 `try...finally:` 自动调用 `kill_process_tree` 级联回收子进程树，并清除 `_active_processes` 注册记录，杜绝孤儿 CLI 进程常驻后台。
+7. **项目执行命令白名单**：
+   - `coop-dev` 显式启用 `project_execution` 后，可通过 `antigravity_cli.project_execution.allowed_commands` 按 `test / build / typecheck` 声明 argv 数组；未声明时仅允许 `python -m pytest`。
+   - 自动闭环由 AgentCooperation `config/policy.yaml` 按仓库相对路径解析策略并覆盖 Profile 默认值；策略同时写入生成的 PreToolUse 钩子与运行时校验器，命令工作目录必须等于工作区根。
+   - 双层校验拒绝 shell 组合、未声明命令、绝对路径/盘符/`..`/受保护路径、工作区遮蔽的可执行文件（`PATH`、`PATHEXT`、工作区根或工作区内符号链接解析到工作区内，含 `git status`），以及 `--rootdir`、`-c`/`-o`（含 `-qc`/`-qo` 组合短参数）、`--script-shell`、`--package`、`--prefix` 等覆盖选项；钩子与运行时同时接受 `CommandLine`/`command`、`Cwd`/`cwd` 及大小写不敏感的路径字段，并对同一参数的大小写变体冲突直接拒绝。运行结束后复核 `settings.json`、项目 `permissionGrants`、全局 `globalPermissionGrants` 与钩子源码。拒绝记录写入本次请求的 `native/policy-audit.jsonl`，并以 `tool_result(policy_rejected=true)` 显示在运行台。
 
 
 ---

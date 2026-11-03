@@ -1,6 +1,10 @@
 """Unit tests for the Web Console application and REST API endpoints."""
 
 import json
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 from web.app import create_app
 from web.runner import job_manager
@@ -23,6 +27,30 @@ def test_health_endpoint(client):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["status"] == "healthy"
+
+
+@pytest.mark.parametrize("path", ["/api/tasks", "/api/multica/run", "/api/multica/issue", "/api/codex/quota", "/api/codex/recovery", "/api/codex/backlog/trigger", "/api/runs", "/api/runs/example/approve", "/api/runs/example/reject"])
+def test_all_writes_reject_cross_origin(client, path):
+    response = client.post(path, json={}, headers={"Origin": "https://evil.example"})
+    assert response.status_code == 403
+
+
+def test_dns_rebinding_host_rejected_even_with_matching_origin(client):
+    response = client.post("/api/runs", json={}, headers={"Host": "evil.example", "Origin": "http://evil.example"})
+    assert response.status_code == 403
+    assert client.get("/", headers={"Host": "evil.example"}).status_code == 403
+
+
+@pytest.mark.parametrize("address", ["192.0.2.1", "::ffff:192.0.2.1", ""])
+def test_remote_client_cannot_write_with_loopback_host(client, address):
+    response = client.post("/api/runs", json={}, headers={"Host": "localhost", "X-Forwarded-For": "127.0.0.1"}, environ_overrides={"REMOTE_ADDR": address})
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("path", ["/", "/health", "/api/runs", "/api/status"])
+def test_remote_client_cannot_read_with_loopback_host(client, path):
+    response = client.get(path, headers={"Host": "localhost", "X-Forwarded-For": "127.0.0.1"}, environ_overrides={"REMOTE_ADDR": "192.0.2.1"})
+    assert response.status_code == 403
 
 
 def test_index_page(client):
@@ -108,6 +136,29 @@ def test_api_create_task_success(client):
     job_data = job_resp.get_json()
     assert job_data["id"] == job_id
     assert job_data["type"] == "run_task"
+
+
+def test_api_create_task_runs_cli_quietly(client, monkeypatch):
+    execute = AsyncMock(return_value=SimpleNamespace(
+        task_id="task_quiet", state="SUCCESS", total_cost_cny=0.0,
+        branch_name=None, result_summary="ok"))
+    monkeypatch.setattr("web.api.execute_task", execute)
+
+    resp = client.post("/api/tasks", json={
+        "requirement": "quiet", "title": "quiet", "model": "glm", "mock": True,
+    })
+    assert resp.status_code == 202
+    job_id = resp.get_json()["job_id"]
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()
+        if job["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.02)
+
+    assert execute.await_count >= 1
+    assert all(call.kwargs.get("quiet") is True for call in execute.await_args_list)
 
 
 def test_api_multica_board(client):

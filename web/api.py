@@ -1,17 +1,22 @@
 """REST API routes for AgentCooperation Web Console."""
 
 import asyncio
+import json
+import re
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request, stream_with_context
 from sqlmodel import select
 
 from agents.codex_expert import CodexExpert
-from config.settings import settings
+from config.settings import PROJECT_ROOT, settings
+from execution.events import event_store
 from integrations.multica import MemoryMulticaClient, MulticaIssue
 from orchestrator.cli import _core_scope, execute_multica_issue, execute_task, run_codex_backlog
+from web import run_service
 from storage.db import (
     get_engine,
     get_or_create_codex_quota,
@@ -291,6 +296,7 @@ def create_task():
             title=title,
             repo_root=repo_root,
             test_command=test_command,
+            quiet=True,
         )
         return {
             "task_id": res.task_id,
@@ -398,6 +404,7 @@ def run_multica_issue():
             repo_root=repo_root,
             test_command=test_command,
             persistence_file=board_file,
+            quiet=True,
         )
         return {
             "issue_id": res.issue_id,
@@ -620,3 +627,332 @@ def get_policy():
         "repair": _serialize(policy.repair),
         "execution": _serialize(policy.execution),
     })
+
+
+def _run_task_summary(task: Task) -> Dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "title": task.title,
+        "state": task.state,
+        "mock_mode": task.mock_mode,
+        "repo_root": task.repo_root,
+        "reviewer_model": task.reviewer_model,
+        "repair_attempts": task.repair_attempts,
+        "commit_sha": task.commit_sha,
+        "test_passed": task.test_passed,
+        "prompt_tokens": task.total_prompt_tokens,
+        "completion_tokens": task.total_completion_tokens,
+        "cost_cny": round(task.total_cost_cny or 0.0, 5),
+        "result_summary": task.result_summary,
+        "created_at": _serialize(task.created_at),
+        "updated_at": _serialize(task.updated_at),
+        "completed_at": _serialize(task.completed_at),
+    }
+
+
+@api_bp.route("/runs/options", methods=["GET"])
+def get_run_options():
+    """Expose whitelisted repositories and smart defaults for the run console."""
+    policy = settings.load_policy()
+    repos = run_service.available_repos(PROJECT_ROOT, policy)
+    project = str(PROJECT_ROOT.resolve())
+    default_repo = next((item["path"] for item in repos if item["path"] == project), None)
+    if default_repo is None and repos:
+        default_repo = repos[0]["path"]
+    return jsonify({
+        "default_repo": default_repo or project,
+        "repos": repos,
+        "reviewers": list(run_service.REVIEWER_CHOICES),
+        "default_reviewer": "glm",
+        "max_repair_attempts": int(getattr(policy.repair, "max_normal_attempts", 3)),
+        "max_repair_limit": run_service.MAX_REPAIR_LIMIT,
+        "allowed_repo_patterns": list(policy.security.allowed_repos or ["."]),
+    })
+
+
+@api_bp.route("/runs", methods=["GET"])
+def list_runs():
+    """List closed-loop runs persisted in the task ledger, newest first."""
+    mock = _is_mock(request)
+    try:
+        limit = int(request.args.get("limit", 50))
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    state_filter = request.args.get("state")
+    repo_filter = (request.args.get("repo") or "").strip()
+    with _core_scope(mock=mock) as core:
+        with core._session() as session:
+            stmt = (
+                select(Task)
+                .where(Task.primary_model == run_service.CLOSED_LOOP_MODEL)
+                .order_by(Task.id.desc())
+                .limit(limit)
+            )
+            if state_filter:
+                stmt = stmt.where(Task.state == state_filter)
+            if repo_filter:
+                repo_path = Path(repo_filter)
+                if not repo_path.is_absolute():
+                    repo_path = PROJECT_ROOT / repo_path
+                stmt = stmt.where(Task.repo_root == str(repo_path.resolve()))
+            tasks = session.exec(stmt).all()
+            return jsonify({
+                "mock_mode": mock,
+                "total": len(tasks),
+                "runs": [_run_task_summary(task) for task in tasks],
+            })
+
+
+@api_bp.route("/runs/<task_id>", methods=["GET"])
+def get_run_detail(task_id: str):
+    """Return one run's task record, execution logs and event cursor."""
+    mock = _is_mock(request)
+    with _core_scope(mock=mock) as core:
+        with core._session() as session:
+            task = session.exec(select(Task).where(Task.task_id == task_id)).first()
+            if not task:
+                return jsonify({"error": f"Run '{task_id}' not found"}), 404
+            logs = session.exec(
+                select(ExecutionLog)
+                .where(ExecutionLog.task_id == task_id)
+                .order_by(ExecutionLog.id.asc())
+            ).all()
+            last_seq = event_store.last_seq(task_id)
+            recent = event_store.read(task_id, after_seq=max(0, last_seq - 20), limit=20)
+            terminal = next((event for event in reversed(recent) if event.is_terminal), None)
+            return jsonify({
+                "mock_mode": mock,
+                "run": _run_task_summary(task),
+                "task": _serialize(task),
+                "logs": [_serialize(log) for log in logs],
+                "events": {
+                    "last_seq": last_seq,
+                    "terminal": terminal.to_dict() if terminal else None,
+                },
+            })
+
+
+@api_bp.route("/runs", methods=["POST"])
+def create_run():
+    """Submit a closed-loop run with smart defaults and streamable events."""
+    if not request.is_json:
+        return jsonify({"error": "Request body must be JSON"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+
+    mock = data.get("mock", False)
+    if not isinstance(mock, bool):
+        return jsonify({"error": "mock must be a boolean"}), 400
+    allow_untrusted = data.get("allow_untrusted_tests", False)
+    if not isinstance(allow_untrusted, bool):
+        return jsonify({"error": "allow_untrusted_tests must be a boolean"}), 400
+    if allow_untrusted:
+        # The web surface never grants untrusted test execution; only the
+        # operator-facing CLI may opt in.
+        return jsonify({"error": "allow_untrusted_tests is not permitted from the web console"}), 403
+
+    try:
+        info = run_service.submit_run(
+            requirement=data.get("requirement") or "",
+            project_root=PROJECT_ROOT,
+            policy=settings.load_policy(),
+            repo=data.get("repo"),
+            reviewer=data.get("reviewer"),
+            max_repair=data.get("max_repair"),
+            test_paths=data.get("test_paths"),
+            title=data.get("title"),
+            allow_untrusted_tests=False,
+            mock=mock,
+            store=event_store,
+        )
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except run_service.RunValidationError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    return jsonify({"success": True, "message": "Run queued", **info}), 202
+
+
+def _submit_approval(task_id: str, approved: bool):
+    """Validate one GUI approval decision and dispatch the resumed run."""
+    mock = _is_mock(request)
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    notes = data.get("notes")
+    if notes is not None and not isinstance(notes, str):
+        return jsonify({"error": "notes must be a string"}), 400
+    if isinstance(notes, str) and len(notes) > 2000:
+        return jsonify({"error": "notes must be at most 2000 characters"}), 400
+    allow_untrusted = data.get("allow_untrusted_tests", False)
+    if not isinstance(allow_untrusted, bool):
+        return jsonify({"error": "allow_untrusted_tests must be a boolean"}), 400
+    if not approved:
+        allow_untrusted = False
+
+    with _core_scope(mock=mock) as core:
+        with core._session() as session:
+            task = session.exec(select(Task).where(Task.task_id == task_id)).first()
+            if not task:
+                return jsonify({"error": f"Run '{task_id}' not found"}), 404
+            if task.primary_model != run_service.CLOSED_LOOP_MODEL:
+                return jsonify({"error": "Only closed-loop runs support GUI approval"}), 400
+            if bool(task.mock_mode) != mock:
+                return jsonify({
+                    "error": "Run mode does not match the requested ledger; refresh the console",
+                }), 409
+            if task.state != "WAITING_APPROVAL":
+                return jsonify({
+                    "error": f"Run '{task_id}' is in state '{task.state}', not 'WAITING_APPROVAL'",
+                    "state": task.state,
+                }), 409
+            repo_root = (task.repo_root or "").strip()
+            if approved and not repo_root:
+                return jsonify({
+                    "error": "Run has no recorded repository; resume it from the CLI",
+                }), 409
+            reviewer_model = task.reviewer_model
+            mock_mode = bool(task.mock_mode)
+
+    try:
+        info = run_service.start_approval(
+            task_id=task_id,
+            approved=approved,
+            notes=notes,
+            allow_untrusted_tests=allow_untrusted,
+            repo_root=repo_root,
+            reviewer_model=reviewer_model,
+            mock_mode=mock_mode,
+            project_root=PROJECT_ROOT,
+            policy=settings.load_policy(),
+            store=event_store,
+        )
+    except run_service.RunConflictError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except run_service.RunValidationError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    action = "approved" if approved else "rejected"
+    return jsonify({"success": True, "message": f"Run {action}", **info}), 202
+
+
+@api_bp.route("/runs/<task_id>/approve", methods=["POST"])
+def approve_run(task_id: str):
+    """Approve a paused closed-loop run and resume it."""
+    return _submit_approval(task_id, True)
+
+
+@api_bp.route("/runs/<task_id>/reject", methods=["POST"])
+def reject_run(task_id: str):
+    """Reject a paused closed-loop run and mark it FAILED."""
+    return _submit_approval(task_id, False)
+
+
+def _parse_after_seq(raw: Any) -> int:
+    try:
+        value = int(raw if raw not in (None, "") else 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("after must be a non-negative integer") from exc
+    if value < 0:
+        raise ValueError("after must be a non-negative integer")
+    return value
+
+
+def _parse_idle_timeout(raw: Any) -> float:
+    if raw in (None, ""):
+        return 30.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("idle_timeout must be a number") from exc
+    return max(0.1, min(value, 120.0))
+
+
+def _parse_heartbeat(raw: Any) -> float:
+    if raw in (None, ""):
+        return 15.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("heartbeat must be a number") from exc
+    return max(0.1, min(value, 60.0))
+
+
+def _sse_event_name(event_type: str) -> str:
+    """Keep the SSE ``event:`` line on a single field-safe token."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", event_type)[:64] or "message"
+
+
+@api_bp.route("/runs/<task_id>/events", methods=["GET"])
+def get_run_events(task_id: str):
+    """Return persisted run events after a sequence number (polling fallback)."""
+    try:
+        after = _parse_after_seq(request.args.get("after"))
+        limit = int(request.args.get("limit", 500))
+        if limit < 1:
+            raise ValueError("limit must be a positive integer")
+        events = event_store.read(task_id, after_seq=after, limit=min(limit, 2000))
+        last_seq = event_store.last_seq(task_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    return jsonify({
+        "task_id": task_id,
+        "events": [event.to_dict() for event in events],
+        "last_seq": last_seq,
+    })
+
+
+@api_bp.route("/runs/<task_id>/events/stream", methods=["GET"])
+def stream_run_events(task_id: str):
+    """Stream run events as Server-Sent Events, resumable via Last-Event-ID."""
+    try:
+        event_store.path_for(task_id)
+        after = _parse_after_seq(
+            request.args.get("after") or request.headers.get("Last-Event-ID")
+        )
+        idle_timeout = _parse_idle_timeout(request.args.get("idle_timeout"))
+        heartbeat = _parse_heartbeat(request.args.get("heartbeat"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    # A finished run needs no long-lived connection: EventSource treats 204 as
+    # "stop reconnecting" and the client already has every event up to ``after``.
+    if after > 0:
+        last = event_store.read(task_id, after_seq=after - 1, limit=1)
+        if last and last[0].seq == after and last[0].is_terminal:
+            return Response(status=204)
+
+    stop = threading.Event()
+
+    def generate():
+        try:
+            yield "retry: 3000\n\n"
+            for event in event_store.tail(
+                task_id,
+                after_seq=after,
+                idle_timeout=idle_timeout,
+                heartbeat_interval=heartbeat,
+                stop_event=stop,
+            ):
+                if event is None:
+                    yield ": ping\n\n"
+                    continue
+                data = json.dumps(event.to_dict(), ensure_ascii=False)
+                yield f"id: {event.seq}\nevent: {_sse_event_name(event.type)}\ndata: {data}\n\n"
+        finally:
+            # A disconnected client must not pin this worker until idle_timeout.
+            stop.set()
+
+    response = Response(stream_with_context(generate()), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response

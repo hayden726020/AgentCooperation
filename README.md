@@ -28,6 +28,8 @@ python -m orchestrator.cli web --port 5000 --mock
 
 特殊测试入口可加 `--test-command "npm test"`。目标测试在本机执行，工作树负责文件版本隔离。模拟与正式账库分开；任务失败或等待验收时 CLI 返回非零状态。
 
+Web 控制台仅接受直接来自本机的连接，不提供身份认证。不要通过未配置身份认证的本机反向代理对外暴露；代理可能使远程请求看起来来自本机。工作树和测试进程也不是文件系统安全沙箱，不应执行不可信测试。
+
 已有 Antigravity 登录时，可在 PowerShell 7.3+ 中直接打开 Gemini High 原生研发会话，无需 Gemini API 密钥：
 
 ```powershell

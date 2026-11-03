@@ -15,15 +15,18 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, Literal, Optional
 import uuid
 
 from sqlmodel import Session, select
+from sqlalchemy import update
 
 from agents.base import AgentResult
 from agents.flash_reviewer import FlashReviewer
 from agents.gemini_dev_agent import GeminiDevAgent
 from config.settings import PROJECT_ROOT, PolicyConfig, settings
+from execution.events import EventStore, RunEventEmitter
 from execution.test_runner import TestRunner
 from execution.worktree import WorktreeManager
 from orchestrator.budget_guard import BudgetGuard, BudgetLimitError
@@ -33,46 +36,12 @@ import re
 
 logger = logging.getLogger(__name__)
 
-_SENSITIVE_PATTERNS = [
-    (re.compile(r"(?i)(api[_-]?key|secret|token|password|bearer|authorization)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{8,})['\"]?"), r"\1=[REDACTED]"),
-    (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "[REDACTED_API_KEY]"),
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_KEY]"),
-    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,255}"), "[REDACTED_GITHUB_TOKEN]"),
-    (re.compile(r"github_pat_[A-Za-z0-9_]{82}"), "[REDACTED_GITHUB_PAT]"),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
-    (re.compile(r"(?i)(postgres|postgresql|mysql|mongodb|redis):\/\/[^\s:]+:[^\s@]+@[^\s\/]+"), r"\1://[REDACTED_DB_CREDENTIALS]"),
-    (re.compile(r"Bearer\s+ya29\.[A-Za-z0-9_\-]+", re.IGNORECASE), "Bearer [REDACTED_OAUTH_TOKEN]"),
-    (re.compile(r"ya29\.[A-Za-z0-9_\-]+"), "[REDACTED_OAUTH_TOKEN]"),
-]
-
-_SENSITIVE_FILES_PATTERN = re.compile(
-    r"(^|[\/\\])(\.env(\..+)?|\.git|\.aws|\.codex|id_rsa|id_ed25519|.*\.pem|.*\.key)$",
-    re.IGNORECASE,
+from execution.security import (
+    _SENSITIVE_FILES_PATTERN,
+    _SENSITIVE_PATTERNS,
+    contains_sensitive_files,
+    redact_and_truncate_evidence,
 )
-
-
-def contains_sensitive_files(paths: list[str]) -> tuple[bool, str]:
-    """Check if any path matches sensitive patterns (.env, .git, .aws, keys, certs)."""
-    for p in paths:
-        p_clean = p.replace("\\", "/").strip("/")
-        parts = p_clean.split("/")
-        for part in parts:
-            if _SENSITIVE_FILES_PATTERN.match(part):
-                return True, p
-        if _SENSITIVE_FILES_PATTERN.match(p_clean):
-            return True, p
-    return False, ""
-
-
-def redact_and_truncate_evidence(content: str, max_chars: int = 40000) -> str:
-    if not content:
-        return ""
-    text = content
-    for pattern, repl in _SENSITIVE_PATTERNS:
-        text = pattern.sub(repl, text)
-    if len(text) > max_chars:
-        text = text[:max_chars] + f"\n... [TRUNCATED {len(text) - max_chars} characters for review safety]"
-    return text
 
 
 def validate_custom_test_cmd(cmd: str | None) -> None:
@@ -116,7 +85,12 @@ def validate_safe_test_paths(paths: Optional[list[str]], worktree: Optional[Path
         if p_str.startswith("-"):
             raise ValueError(f"Flag arguments not permitted in test paths: {p_str}")
         p_obj = Path(p_str)
-        if p_obj.is_absolute() or p_str.startswith("/") or p_str.startswith("\\"):
+        if (
+            p_obj.is_absolute()
+            or p_str.startswith("/")
+            or p_str.startswith("\\")
+            or (len(p_str) > 1 and p_str[1] == ":" and p_str[0].isalpha())
+        ):
             raise ValueError(f"Absolute test paths disallowed: {p_str}")
         if ".." in p_obj.parts:
             raise ValueError(f"Path traversal ('..') disallowed: {p_str}")
@@ -189,6 +163,7 @@ class GeminiClosedLoopOrchestrator:
         policy: Optional[PolicyConfig] = None,
         reviewer_choice: Literal["glm", "deepseek"] = "glm",
         max_repair_attempts: Optional[int] = None,
+        event_store: Optional[EventStore] = None,
     ):
         self.repo_root = (repo_root or Path.cwd()).resolve()
         self.session = session
@@ -202,6 +177,79 @@ class GeminiClosedLoopOrchestrator:
             if max_repair_attempts is not None
             else getattr(self.policy.repair, "max_normal_attempts", 3)
         )
+        self.event_store = event_store
+        self._events: Optional[RunEventEmitter] = None
+        self._usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "cost_cny": 0.0}
+
+    @staticmethod
+    def _new_task_id() -> str:
+        return (
+            f"task_gemini_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+
+    def _emit(self, event_type: str, *, agent: str = "system", phase: str = "", **payload: Any) -> None:
+        if self._events is not None:
+            self._events.emit(event_type, agent=agent, phase=phase, payload=payload)
+
+    def _emit_policy_rejections(self, result: AgentResult, *, phase: str,
+                                attempt: Optional[int] = None) -> None:
+        """Publish command-policy denials as auditable run events."""
+        rejections = (result.metadata or {}).get("policy_rejections", [])
+        if not isinstance(rejections, list):
+            return
+        for item in rejections:
+            if not isinstance(item, dict):
+                continue
+            payload = {
+                "name": item.get("name") or "run_command",
+                "succeeded": False,
+                "policy_rejected": True,
+                "command": item.get("command"),
+                "reason": item.get("reason"),
+            }
+            if attempt is not None:
+                payload["attempt"] = attempt
+            self._emit("tool_result", agent="gemini", phase=phase, **payload)
+
+    def _record_usage(
+        self,
+        task_id: str,
+        *,
+        agent: str,
+        model: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost_cny: float = 0.0,
+        duration_s: float = 0.0,
+        mock_mode: bool = False,
+        persist_task: bool = True,
+    ) -> None:
+        self._usage_total["prompt_tokens"] += int(prompt_tokens or 0)
+        self._usage_total["completion_tokens"] += int(completion_tokens or 0)
+        self._usage_total["cost_cny"] += float(cost_cny or 0.0)
+        if persist_task:
+            # BudgetGuard.settle_call already persists guarded calls; only
+            # unguarded calls (development/repair) write the task ledger here.
+            with self._provide_session(mock_mode) as s:
+                task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+                if task:
+                    task.total_prompt_tokens += int(prompt_tokens or 0)
+                    task.total_completion_tokens += int(completion_tokens or 0)
+                    task.total_cost_cny += float(cost_cny or 0.0)
+                    task.updated_at = utc_now()
+                    s.add(task)
+                    s.commit()
+        self._emit(
+            "usage",
+            agent=agent,
+            phase="usage",
+            model=model,
+            prompt_tokens=int(prompt_tokens or 0),
+            completion_tokens=int(completion_tokens or 0),
+            cost_cny=round(float(cost_cny or 0.0), 5),
+            duration_s=round(float(duration_s or 0.0), 3),
+        )
 
     def _new_dev_agent(self, mock_mode: bool) -> GeminiDevAgent:
         """Create a Gemini developer with the bounded policy timeout."""
@@ -209,6 +257,43 @@ class GeminiClosedLoopOrchestrator:
             mock_mode=mock_mode,
             timeout=float(self.policy.execution.model_timeout_seconds),
         )
+
+    def _seed_usage_from_task(self, task_id: str, mock_mode: bool) -> None:
+        """Carry prior-segment usage into a resumed run's terminal totals."""
+        with self._provide_session(mock_mode) as s:
+            task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+            if task:
+                self._usage_total = {
+                    "prompt_tokens": int(task.total_prompt_tokens or 0),
+                    "completion_tokens": int(task.total_completion_tokens or 0),
+                    "cost_cny": float(task.total_cost_cny or 0.0),
+                }
+
+    def _restore_approval_state(
+        self, task_id: str, mock_mode: bool, reason: str, *, claim_id: str,
+        retryable: bool = True,
+    ) -> Optional[str]:
+        """Keep an interrupted resume retryable; never rewind a run this call does not own."""
+        with self._provide_session(mock_mode) as s:
+            s.exec(update(Task).where(
+                Task.task_id == task_id, Task.approval_claim_id == claim_id,
+                Task.state.in_(("REPAIRING", "TESTING", "REVIEWING")),
+            ).values(state="WAITING_APPROVAL" if retryable else "INTERRUPTED",
+                     result_summary=(reason if retryable else
+                         "Approval interrupted after execution began; inspect side effects and costs before recovery: " + reason)[:2000],
+                     updated_at=utc_now()))
+            s.commit()
+            s.expire_all()
+            task = s.exec(select(Task).where(Task.task_id == task_id)).first()
+            if not task:
+                return None
+            return task.state
+
+    def _release_approval_claim(self, task_id: str, mock_mode: bool, claim_id: str) -> None:
+        with self._provide_session(mock_mode) as s:
+            s.exec(update(Task).where(Task.task_id == task_id, Task.approval_claim_id == claim_id)
+                   .values(approval_claim_id=None))
+            s.commit()
 
     @staticmethod
     def _is_production_session(session: Optional[Session]) -> bool:
@@ -287,6 +372,7 @@ class GeminiClosedLoopOrchestrator:
         reviewer_model: Optional[str] = None,
         test_passed: Optional[bool] = None,
         worktree_path: Optional[str] = None,
+        base_ref: Optional[str] = None,
     ):
         with self._provide_session(mock_mode) as s:
             task = s.exec(select(Task).where(Task.task_id == task_id)).first()
@@ -304,10 +390,21 @@ class GeminiClosedLoopOrchestrator:
                     task.test_passed = test_passed
                 if worktree_path is not None:
                     task.worktree_path = worktree_path
+                if base_ref is not None:
+                    task.base_ref = base_ref
                 if state in ("SUCCESS", "FAILED", "WAITING_APPROVAL"):
                     task.completed_at = utc_now()
                 s.add(task)
                 s.commit()
+        self._emit(
+            "status",
+            phase="state",
+            state=state,
+            repair_attempts=repair_attempts,
+            summary=(result_summary or "")[:2000],
+            commit_sha=commit_sha,
+            test_passed=test_passed,
+        )
 
     @staticmethod
     def _test_paths(worktree: Path, generated_files: list[str]) -> list[str]:
@@ -339,16 +436,100 @@ class GeminiClosedLoopOrchestrator:
 
     @staticmethod
     def _detect_modified_or_new_tests(files: list[str]) -> list[str]:
+        test_config_names = {"conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"}
         tests = []
         for f in files:
-            p = Path(f)
-            name = p.name
-            normalized = f.replace("\\", "/")
-            if name.startswith("test_") or name.endswith("_test.py") or "tests/" in normalized:
+            normalized = f.replace("\\", "/").lower()
+            name = normalized.rsplit("/", 1)[-1]
+            parts = [part for part in normalized.split("/") if part]
+            if (
+                name.startswith("test_")
+                or name.endswith("_test.py")
+                or "tests" in parts
+                or name in test_config_names
+            ):
                 tests.append(f)
         return sorted(set(tests))
 
     async def run(
+        self,
+        requirement: str,
+        title: Optional[str] = None,
+        mock_mode: bool = False,
+        custom_test_cmd: Optional[str] = None,
+        test_paths: Optional[list[str]] = None,
+        allow_untrusted_tests: bool = False,
+        dev_agent: Optional[GeminiDevAgent] = None,
+        reviewer_agent: Optional[FlashReviewer] = None,
+        task_id: Optional[str] = None,
+    ) -> ClosedLoopResult:
+        """Run the closed loop while publishing a replayable event stream.
+
+        One orchestrator instance drives one run at a time; the in-flight
+        emitter is instance-scoped so nested helper calls can report status.
+        """
+        task_id = task_id or self._new_task_id()
+        self._events = RunEventEmitter(task_id, self.event_store)
+        self._usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "cost_cny": 0.0}
+        started = time.monotonic()
+        try:
+            result = await self._run_impl(
+                requirement=requirement,
+                title=title,
+                mock_mode=mock_mode,
+                custom_test_cmd=custom_test_cmd,
+                test_paths=test_paths,
+                allow_untrusted_tests=allow_untrusted_tests,
+                dev_agent=dev_agent,
+                reviewer_agent=reviewer_agent,
+                task_id=task_id,
+            )
+        except BaseException as exc:
+            self._finalize_events(exc=exc, started=started)
+            raise
+        self._finalize_events(result=result, started=started)
+        return result
+
+    def _finalize_events(
+        self,
+        *,
+        result: Optional[ClosedLoopResult] = None,
+        exc: Optional[BaseException] = None,
+        started: float,
+        state: Optional[str] = None,
+        terminal: Optional[bool] = None,
+    ) -> None:
+        events = self._events
+        self._events = None
+        if events is None:
+            return
+        duration = round(time.monotonic() - started, 3)
+        if result is not None:
+            payload = {
+                "success": result.success,
+                "state": result.state,
+                "terminal": result.state != "WAITING_APPROVAL",
+                "summary": result.result_summary,
+                "repair_attempts": result.repair_attempts,
+                "final_commit_sha": result.final_commit_sha,
+                "test_passed": result.artifacts.test_passed if result.artifacts else None,
+                "verdict": asdict(result.verdict) if result.verdict else None,
+                "duration_s": duration,
+                **self._usage_total,
+            }
+        else:
+            payload = {
+                "success": False,
+                "state": state or ("INTERRUPTED" if isinstance(exc, asyncio.CancelledError) else "FAILED"),
+                "terminal": True if terminal is None else terminal,
+                "summary": str(exc) if str(exc) else type(exc).__name__,
+                "repair_attempts": 0,
+                "duration_s": duration,
+                **self._usage_total,
+            }
+        events.emit("result", agent="system", phase="terminal", payload=payload)
+
+    async def _run_impl(
         self,
         requirement: str,
         title: Optional[str] = None,
@@ -374,8 +555,17 @@ class GeminiClosedLoopOrchestrator:
             if not can_start:
                 raise BudgetLimitError(budget_msg)
 
-        task_id = task_id or f"task_gemini_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        task_id = task_id or self._new_task_id()
         title = title or requirement[:40]
+
+        # Instantiate agents before persisting the task so the requested
+        # reviewer and repair bounds survive an approval pause.
+        dev = dev_agent or self._new_dev_agent(mock_mode)
+        reviewer = reviewer_agent or FlashReviewer(
+            model_key=self.reviewer_choice,
+            budget_cfg=self.policy.budget,
+            mock_mode=mock_mode,
+        )
 
         # Initialize Task record with mock_mode isolation and repo_root
         with self._provide_session(mock_mode) as s:
@@ -389,15 +579,20 @@ class GeminiClosedLoopOrchestrator:
                     state="INIT",
                     mock_mode=mock_mode,
                     repo_root=str(self.repo_root),
+                    reviewer_model=reviewer.model_name,
+                    max_repair_attempts=self.max_repair_attempts,
+                    test_paths=json.dumps(test_paths) if test_paths else None,
                 )
             )
             s.commit()
 
-        # Instantiate agents if not provided
-        dev = dev_agent or self._new_dev_agent(mock_mode)
-        reviewer = reviewer_agent or FlashReviewer(
-            model_key=self.reviewer_choice,
-            budget_cfg=self.policy.budget,
+        self._emit(
+            "status",
+            phase="state",
+            state="INIT",
+            title=title,
+            requirement=requirement[:2000],
+            repo_root=str(self.repo_root),
             mock_mode=mock_mode,
         )
 
@@ -408,12 +603,24 @@ class GeminiClosedLoopOrchestrator:
 
         worktree = (await self.worktree_mgr.create_worktree(task_id)).resolve()
         base_ref = await self.worktree_mgr.get_base_ref(worktree)
+        self._emit(
+            "status",
+            phase="worktree",
+            state="DEVELOPING",
+            worktree=str(worktree),
+            base_ref=base_ref,
+            developer=dev.model_name,
+            reviewer=reviewer.model_name,
+        )
 
         try:
             # -----------------------------------------------------------------
             # 1. Task Handoff & Initial Gemini Development
             # -----------------------------------------------------------------
-            self._save_task_state(task_id, "DEVELOPING", repair_attempts=0, mock_mode=mock_mode, worktree_path=str(worktree))
+            self._save_task_state(
+                task_id, "DEVELOPING", repair_attempts=0, mock_mode=mock_mode,
+                worktree_path=str(worktree), base_ref=base_ref,
+            )
             self._log_step(task_id, "Task Handoff to Gemini", "PRIMARY_DEVELOPER", dev.model_name, "IN_PROGRESS", mock_mode=mock_mode)
 
             dev_prompt = (
@@ -425,11 +632,31 @@ class GeminiClosedLoopOrchestrator:
                 "   Never run the entire project test suite without arguments. Do not run commands in the background.\n"
                 "3. Allowed tools: view_file, grep_search, write_to_file, replace_file_content, run_command."
             )
-            dev_result = await dev.execute(dev_prompt, context={"worktree_path": worktree})
+
+            def dev_line(stream: str, line: str) -> None:
+                self._emit("output", agent="gemini", phase="develop", stream=stream, text=line)
+
+            self._emit("status", agent="gemini", phase="develop", stage="start", model=dev.model_name)
+            dev_result = await dev.execute(
+                dev_prompt,
+                context={"worktree_path": worktree, "repo_root": str(self.repo_root), "on_line": dev_line},
+            )
+            self._record_usage(
+                task_id,
+                agent="gemini",
+                model=dev.model_name,
+                prompt_tokens=dev_result.prompt_tokens,
+                completion_tokens=dev_result.completion_tokens,
+                cost_cny=dev_result.cost_cny,
+                duration_s=dev_result.duration_s,
+                mock_mode=mock_mode,
+            )
+            self._emit_policy_rejections(dev_result, phase="develop")
             if not dev_result.success:
                 error_msg = f"Gemini initial development failed: {dev_result.error}"
                 self._save_task_state(task_id, "FAILED", 0, error_msg, mock_mode=mock_mode)
                 self._log_step(task_id, "Gemini Development", "PRIMARY_DEVELOPER", dev.model_name, "FAILED", error_snippet=error_msg, mock_mode=mock_mode)
+                self._emit("status", agent="gemini", phase="develop", stage="failed", error=error_msg)
                 return ClosedLoopResult(
                     task_id=task_id,
                     success=False,
@@ -440,7 +667,26 @@ class GeminiClosedLoopOrchestrator:
 
             # Gate 1: Check for successful native file writes
             files_written = dev_result.metadata.get("files_written", [])
+            observed_paths = await self.worktree_mgr.get_changed_paths(worktree)
+            ignored_paths = await self.worktree_mgr.get_changed_paths(worktree, include_ignored=True)
+            committed_paths = await self.worktree_mgr.get_changed_paths_since(worktree, base_ref)
+            files_written = sorted(set(files_written) | set(observed_paths))
             native_tools = dev_result.metadata.get("native_tool_steps", [])
+            for step in native_tools:
+                if not isinstance(step, dict):
+                    continue
+                payload = {
+                    "name": step.get("name"),
+                    "succeeded": step.get("succeeded"),
+                    "parameters": step.get("parameters") or {},
+                }
+                self._emit("tool_call", agent="gemini", phase="develop", **payload)
+                self._emit("tool_result", agent="gemini", phase="develop", **payload)
+            self._emit(
+                "status", agent="gemini", phase="develop", stage="complete",
+                success=dev_result.success, files_written=files_written,
+                tool_steps=len(native_tools), duration_s=dev_result.duration_s,
+            )
             has_write_tool = any(
                 item.get("name") in ("write_to_file", "replace_file_content") and item.get("succeeded")
                 for item in native_tools
@@ -471,9 +717,15 @@ class GeminiClosedLoopOrchestrator:
                 return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=0)
 
             self._log_step(task_id, "Commit Gemini Implementation", "SYSTEM", "Git", "SUCCESS", output_snippet=checkpoint_sha, mock_mode=mock_mode)
+            self._emit(
+                "diff", phase="diff", commit_sha=checkpoint_sha, base_ref=base_ref,
+                generated_files=files_written, patch=diff,
+            )
 
             # Check untrusted test files
-            untrusted_tests = self._detect_modified_or_new_tests(files_written)
+            untrusted_tests = self._detect_modified_or_new_tests(
+                sorted(set(files_written) | set(ignored_paths) | set(committed_paths))
+            )
             if untrusted_tests and not allow_untrusted_tests and not mock_mode:
                 wait_msg = (
                     f"Untrusted test code generated or modified without OS sandbox isolation: {untrusted_tests}. "
@@ -481,6 +733,10 @@ class GeminiClosedLoopOrchestrator:
                 )
                 self._save_task_state(task_id, "WAITING_APPROVAL", 0, wait_msg, mock_mode=mock_mode, commit_sha=checkpoint_sha)
                 self._log_step(task_id, "Sandbox Gate: Untrusted Test Code", "SECURITY", "Gate", "WAITING_APPROVAL", output_snippet=wait_msg, mock_mode=mock_mode)
+                self._emit(
+                    "approval_required", phase="approval", reason=wait_msg,
+                    commit_sha=checkpoint_sha, tests=untrusted_tests,
+                )
                 return ClosedLoopResult(
                     task_id=task_id,
                     success=False,
@@ -497,7 +753,23 @@ class GeminiClosedLoopOrchestrator:
             # Run test verification
             chosen_tests = validate_safe_test_paths(test_paths, worktree) if test_paths else self._test_paths(worktree, files_written)
             runner = TestRunner(worktree, test_paths=chosen_tests or None)
-            test_res = await runner.run(timeout=self.policy.execution.timeout_seconds)
+            self._save_task_state(
+                task_id, "TESTING", repair_attempts=repair_attempts, mock_mode=mock_mode,
+                commit_sha=checkpoint_sha, base_ref=base_ref,
+            )
+
+            def test_line(line: str, stream: str) -> None:
+                self._emit("test_line", agent="pytest", phase="test", stream=stream, line=line)
+
+            self._emit("status", agent="pytest", phase="test", stage="start", targets=chosen_tests)
+            test_res = await runner.run(timeout=self.policy.execution.timeout_seconds, on_line=test_line)
+            self._emit(
+                "status", agent="pytest", phase="test", stage="complete",
+                passed=test_res.passed, total=getattr(test_res, "total_tests", 0),
+                failed=getattr(test_res, "failed_tests", 0),
+                duration_s=getattr(test_res, "duration_s", 0.0),
+                summary=getattr(test_res, "summary", ""),
+            )
 
             # Gate 3: Verify clean working directory, unchanged HEAD and tree hash after test
             is_clean = await self.worktree_mgr.is_clean(worktree)
@@ -531,6 +803,10 @@ class GeminiClosedLoopOrchestrator:
                 tree_hash=tree_before,
                 evidence_id=str(uuid.uuid4())[:8],
             )
+            self._emit(
+                "diff", phase="diff", commit_sha=latest_artifacts.commit_sha,
+                base_ref=base_ref, generated_files=files_written, patch=diff,
+            )
 
             # -----------------------------------------------------------------
             # 2. Main Loop: Artifact Transfer, Review Verdict, & Failure Retries
@@ -540,6 +816,10 @@ class GeminiClosedLoopOrchestrator:
                 if not latest_artifacts.test_passed:
                     rejection_reason = f"Local tests failed before review:\n{latest_artifacts.test_summary}"
                     severity = "P1"
+                    self._emit(
+                        "status", agent="pytest", phase="review", stage="skipped",
+                        reason="local tests failed", summary=latest_artifacts.test_summary[:2000],
+                    )
                 else:
                     # ---------------------------------------------------------
                     # 2a. Artifact Transfer to Independent Reviewer
@@ -553,6 +833,12 @@ class GeminiClosedLoopOrchestrator:
                         "IN_PROGRESS",
                         output_snippet=f"Commit: {latest_artifacts.commit_sha[:8]}, Diff lines: {len(diff.splitlines())}",
                         mock_mode=mock_mode,
+                    )
+                    self._emit(
+                        "status", agent=reviewer.model_key, phase="review", stage="start",
+                        model=reviewer.model_name, commit_sha=latest_artifacts.commit_sha,
+                        diff_lines=len(diff.splitlines()), test_passed=latest_artifacts.test_passed,
+                        attempt=repair_attempts,
                     )
 
                     review_prompt = "Review requirements, code implementation, and actual test evidence."
@@ -577,11 +863,26 @@ class GeminiClosedLoopOrchestrator:
                         review_res.completion_tokens or 0,
                         cost_cny=actual_cost,
                     )
+                    self._record_usage(
+                        task_id,
+                        agent=reviewer.model_key,
+                        model=reviewer.model_name,
+                        prompt_tokens=review_res.prompt_tokens,
+                        completion_tokens=review_res.completion_tokens,
+                        cost_cny=actual_cost,
+                        duration_s=review_res.duration_s,
+                        mock_mode=mock_mode,
+                        persist_task=False,
+                    )
 
                     if not review_res.success:
                         error_msg = f"Independent review failed: {review_res.error}"
                         self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode, commit_sha=latest_artifacts.commit_sha)
                         self._log_step(task_id, "Independent Review", "REVIEWER", reviewer.model_name, "FAILED", error_snippet=error_msg, mock_mode=mock_mode)
+                        self._emit(
+                            "status", agent=reviewer.model_key, phase="review", stage="failed",
+                            error=error_msg,
+                        )
                         return ClosedLoopResult(
                             task_id=task_id,
                             success=False,
@@ -613,6 +914,11 @@ class GeminiClosedLoopOrchestrator:
                         cost_cny=review_res.cost_cny,
                         mock_mode=mock_mode,
                     )
+                    self._emit(
+                        "output", agent=reviewer.model_key, phase="review",
+                        verdict=asdict(latest_verdict),
+                        text=latest_verdict.summary,
+                    )
 
                     history.append({
                         "attempt": repair_attempts,
@@ -634,6 +940,7 @@ class GeminiClosedLoopOrchestrator:
                             task_id, "SUCCESS", repair_attempts, success_summary,
                             mock_mode=mock_mode, commit_sha=latest_artifacts.commit_sha,
                             reviewer_model=reviewer.model_name, test_passed=latest_artifacts.test_passed,
+                            base_ref=base_ref,
                         )
                         return ClosedLoopResult(
                             task_id=task_id,
@@ -657,6 +964,12 @@ class GeminiClosedLoopOrchestrator:
                             task_id, "WAITING_APPROVAL", repair_attempts, p0_summary,
                             mock_mode=mock_mode, commit_sha=latest_artifacts.commit_sha,
                             reviewer_model=reviewer.model_name, test_passed=latest_artifacts.test_passed,
+                            base_ref=base_ref,
+                        )
+                        self._emit(
+                            "approval_required", phase="approval", reason=p0_summary,
+                            severity=latest_verdict.severity, commit_sha=latest_artifacts.commit_sha,
+                            verdict=asdict(latest_verdict), attempt=repair_attempts,
                         )
                         return ClosedLoopResult(
                             task_id=task_id,
@@ -700,7 +1013,10 @@ class GeminiClosedLoopOrchestrator:
 
                 # Proceed with repair
                 repair_attempts += 1
-                self._save_task_state(task_id, "REPAIRING", repair_attempts=repair_attempts, mock_mode=mock_mode)
+                self._save_task_state(
+                    task_id, "REPAIRING", repair_attempts=repair_attempts, mock_mode=mock_mode,
+                    base_ref=base_ref,
+                )
                 self._log_step(
                     task_id,
                     f"Gemini Repair Attempt #{repair_attempts}",
@@ -710,6 +1026,10 @@ class GeminiClosedLoopOrchestrator:
                     output_snippet=rejection_reason[:300],
                     mock_mode=mock_mode,
                 )
+                self._emit(
+                    "status", agent="gemini", phase="repair", stage="start",
+                    attempt=repair_attempts, reason=rejection_reason[:2000],
+                )
 
                 repair_prompt = (
                     f"Requirement:\n{requirement}\n\n"
@@ -717,11 +1037,33 @@ class GeminiClosedLoopOrchestrator:
                     "Repair the code implementation to resolve these issues. "
                     "Ensure tests pass and the implementation satisfies all requirements."
                 )
-                repair_res = await dev.execute(repair_prompt, context={"worktree_path": worktree})
+
+                def repair_line(stream: str, line: str) -> None:
+                    self._emit("output", agent="gemini", phase="repair", stream=stream, text=line, attempt=repair_attempts)
+
+                repair_res = await dev.execute(
+                    repair_prompt,
+                    context={"worktree_path": worktree, "repo_root": str(self.repo_root), "on_line": repair_line},
+                )
+                self._record_usage(
+                    task_id,
+                    agent="gemini",
+                    model=dev.model_name,
+                    prompt_tokens=repair_res.prompt_tokens,
+                    completion_tokens=repair_res.completion_tokens,
+                    cost_cny=repair_res.cost_cny,
+                    duration_s=repair_res.duration_s,
+                    mock_mode=mock_mode,
+                )
+                self._emit_policy_rejections(repair_res, phase="repair", attempt=repair_attempts)
 
                 if not repair_res.success:
                     error_msg = f"Gemini repair attempt #{repair_attempts} failed: {repair_res.error}"
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    self._emit(
+                        "status", agent="gemini", phase="repair", stage="failed",
+                        attempt=repair_attempts, error=error_msg,
+                    )
                     return ClosedLoopResult(
                         task_id=task_id,
                         success=False,
@@ -734,10 +1076,47 @@ class GeminiClosedLoopOrchestrator:
                     )
 
                 repair_files = repair_res.metadata.get("files_written", [])
+                observed_paths = await self.worktree_mgr.get_changed_paths(worktree)
+                ignored_paths = await self.worktree_mgr.get_changed_paths(worktree, include_ignored=True)
+                repair_files = sorted(set(repair_files) | set(observed_paths))
+                repair_tools = repair_res.metadata.get("native_tool_steps", [])
+                for step in repair_tools:
+                    if not isinstance(step, dict):
+                        continue
+                    payload = {
+                        "name": step.get("name"),
+                        "succeeded": step.get("succeeded"),
+                        "parameters": step.get("parameters") or {},
+                        "attempt": repair_attempts,
+                    }
+                    self._emit("tool_call", agent="gemini", phase="repair", **payload)
+                    self._emit("tool_result", agent="gemini", phase="repair", **payload)
+                self._emit(
+                    "status", agent="gemini", phase="repair", stage="complete",
+                    attempt=repair_attempts, files_written=repair_files,
+                    tool_steps=len(repair_tools), duration_s=repair_res.duration_s,
+                )
                 has_sens, sens_path = contains_sensitive_files(repair_files)
                 if has_sens:
                     error_msg = f"Security violation in repair #{repair_attempts}: touched sensitive path: {sens_path}"
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
+
+                committed_paths = await self.worktree_mgr.get_changed_paths_since(worktree, base_ref)
+                untrusted_tests = self._detect_modified_or_new_tests(
+                    sorted(set(repair_files) | set(ignored_paths) | set(committed_paths))
+                )
+                if untrusted_tests and not allow_untrusted_tests and not mock_mode:
+                    error_msg = (
+                        f"Untrusted test code generated or modified during repair #{repair_attempts}: {untrusted_tests}. "
+                        "Aborting before execution."
+                    )
+                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    self._log_step(task_id, "Sandbox Gate: Untrusted Test Code", "SECURITY", "Gate", "FAILED", error_snippet=error_msg, mock_mode=mock_mode)
+                    self._emit(
+                        "status", agent="system", phase="repair", stage="failed",
+                        attempt=repair_attempts, error=error_msg,
+                    )
                     return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
                 checkpoint_sha = await self.worktree_mgr.commit_checkpoint(
@@ -746,9 +1125,32 @@ class GeminiClosedLoopOrchestrator:
                 head_before = await self.worktree_mgr.get_head_sha(worktree)
                 tree_before = await self.worktree_mgr.get_tree_hash(worktree, checkpoint_sha)
 
-                repair_paths = self._test_paths(worktree, repair_files) or (validate_safe_test_paths(test_paths, worktree) if test_paths else None)
+                repair_paths = (validate_safe_test_paths(test_paths, worktree) if test_paths else None) or self._test_paths(worktree, repair_files)
                 runner = TestRunner(worktree, test_paths=repair_paths or None)
-                test_res = await runner.run(timeout=self.policy.execution.timeout_seconds)
+                self._save_task_state(
+                    task_id, "TESTING", repair_attempts=repair_attempts, mock_mode=mock_mode,
+                    commit_sha=checkpoint_sha, base_ref=base_ref,
+                )
+
+                def repair_test_line(line: str, stream: str) -> None:
+                    self._emit(
+                        "test_line", agent="pytest", phase="repair-test",
+                        stream=stream, line=line, attempt=repair_attempts,
+                    )
+
+                self._emit(
+                    "status", agent="pytest", phase="repair-test", stage="start",
+                    attempt=repair_attempts, targets=repair_paths,
+                )
+                test_res = await runner.run(timeout=self.policy.execution.timeout_seconds, on_line=repair_test_line)
+                self._emit(
+                    "status", agent="pytest", phase="repair-test", stage="complete",
+                    attempt=repair_attempts, passed=test_res.passed,
+                    total=getattr(test_res, "total_tests", 0),
+                    failed=getattr(test_res, "failed_tests", 0),
+                    duration_s=getattr(test_res, "duration_s", 0.0),
+                    summary=getattr(test_res, "summary", ""),
+                )
 
                 is_clean = await self.worktree_mgr.is_clean(worktree)
                 head_after = await self.worktree_mgr.get_head_sha(worktree)
@@ -776,6 +1178,11 @@ class GeminiClosedLoopOrchestrator:
                     tree_hash=tree_before,
                     evidence_id=str(uuid.uuid4())[:8],
                 )
+                self._emit(
+                    "diff", phase="diff", attempt=repair_attempts,
+                    commit_sha=checkpoint_sha, base_ref=base_ref,
+                    generated_files=repair_files, patch=diff,
+                )
 
         except BudgetLimitError as err:
             self._save_task_state(task_id, "BUDGET_STOPPED", repair_attempts, str(err), mock_mode=mock_mode)
@@ -792,6 +1199,12 @@ class GeminiClosedLoopOrchestrator:
         except Exception as exc:
             logger.exception("Unexpected error during Gemini closed loop: %s", exc)
             err_msg = f"Fatal execution exception: {exc}"
+            try:
+                if "worktree" in locals() and worktree:
+                    probe = await self.worktree_mgr.probe_worktree_status(worktree, base_ref=base_ref if "base_ref" in locals() else None)
+                    err_msg = f"{err_msg} | Worktree probe: {probe.summary}"
+            except Exception:
+                pass
             self._save_task_state(task_id, "FAILED", repair_attempts, err_msg, mock_mode=mock_mode)
             return ClosedLoopResult(
                 task_id=task_id,
@@ -809,9 +1222,68 @@ class GeminiClosedLoopOrchestrator:
         mock_mode: bool = False,
         custom_test_cmd: Optional[str] = None,
         test_paths: Optional[list[str]] = None,
-        allow_untrusted_tests: bool = True,
+        allow_untrusted_tests: bool = False,
         dev_agent: Optional[GeminiDevAgent] = None,
         reviewer_agent: Optional[FlashReviewer] = None,
+    ) -> ClosedLoopResult:
+        """Resume an approval-blocked run while publishing its event stream."""
+        claim_id = uuid.uuid4().hex
+        with self._provide_session(mock_mode) as s:
+            claimed = s.exec(update(Task).where(
+                Task.task_id == task_id, Task.state == "WAITING_APPROVAL",
+                Task.approval_claim_id.is_(None),
+            ).values(state="REPAIRING", approval_claim_id=claim_id, updated_at=utc_now()))
+            s.commit()
+            if claimed.rowcount != 1:
+                raise ValueError(f"Task '{task_id}' not found or unavailable; expected 'WAITING_APPROVAL'.")
+            s.expire_all()
+        started = time.monotonic()
+        resume_progress = {"effects_started": False}
+        try:
+            self._events = RunEventEmitter(task_id, self.event_store)
+            self._usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "cost_cny": 0.0}
+            self._seed_usage_from_task(task_id, mock_mode)
+            result = await self._resume_impl(
+                task_id=task_id,
+                approved=approved,
+                notes=notes,
+                mock_mode=mock_mode,
+                custom_test_cmd=custom_test_cmd,
+                test_paths=test_paths,
+                allow_untrusted_tests=allow_untrusted_tests,
+                dev_agent=dev_agent,
+                reviewer_agent=reviewer_agent,
+                resume_progress=resume_progress,
+            )
+        except BaseException as exc:
+            state = self._restore_approval_state(
+                task_id, mock_mode, str(exc) or type(exc).__name__,
+                claim_id=claim_id,
+                retryable=not resume_progress["effects_started"],
+            )
+            self._finalize_events(
+                exc=exc, started=started, state=state,
+                terminal=(state != "WAITING_APPROVAL"),
+            )
+            raise
+        else:
+            self._finalize_events(result=result, started=started)
+            return result
+        finally:
+            self._release_approval_claim(task_id, mock_mode, claim_id)
+
+    async def _resume_impl(
+        self,
+        task_id: str,
+        approved: bool,
+        notes: Optional[str] = None,
+        mock_mode: bool = False,
+        custom_test_cmd: Optional[str] = None,
+        test_paths: Optional[list[str]] = None,
+        allow_untrusted_tests: bool = False,
+        dev_agent: Optional[GeminiDevAgent] = None,
+        reviewer_agent: Optional[FlashReviewer] = None,
+        resume_progress: Optional[dict[str, bool]] = None,
     ) -> ClosedLoopResult:
         """Resume execution of a Gemini closed-loop task held in WAITING_APPROVAL.
 
@@ -827,21 +1299,16 @@ class GeminiClosedLoopOrchestrator:
             task = s.exec(select(Task).where(Task.task_id == task_id)).first()
             if not task:
                 raise ValueError(f"Task '{task_id}' not found.")
-            if task.state != "WAITING_APPROVAL":
-                raise ValueError(f"Task '{task_id}' is in state '{task.state}', expected 'WAITING_APPROVAL'.")
+            if task.state != "REPAIRING":
+                raise ValueError(f"Task '{task_id}' is in state '{task.state}', expected 'REPAIRING'.")
             requirement = task.requirement
             current_repair_attempts = task.repair_attempts
             stored_worktree = task.worktree_path
             reviewer_model_str = task.reviewer_model
             stored_repo_root = task.repo_root
             pre_p0_checkpoint = task.commit_sha
-
-        # Validate task repository root
-        if stored_repo_root:
-            stored_path = Path(stored_repo_root).resolve()
-            if stored_path != self.repo_root:
-                if not (stored_path / ".git").exists():
-                    raise ValueError(f"Task stored repo root is invalid: {stored_repo_root}")
+            stored_max_repair = task.max_repair_attempts
+            stored_test_paths = task.test_paths
 
         if not approved:
             decision_note = notes or "Rejected by human operator"
@@ -856,6 +1323,10 @@ class GeminiClosedLoopOrchestrator:
                 error_snippet=err_msg,
                 mock_mode=mock_mode,
             )
+            self._emit(
+                "output", agent="human", phase="approval", decision="rejected",
+                text=decision_note,
+            )
             return ClosedLoopResult(
                 task_id=task_id,
                 success=False,
@@ -863,6 +1334,40 @@ class GeminiClosedLoopOrchestrator:
                 result_summary=err_msg,
                 repair_attempts=current_repair_attempts,
             )
+
+        if test_paths is None and stored_test_paths:
+            try:
+                recovered_paths = json.loads(stored_test_paths)
+            except (TypeError, ValueError):
+                recovered_paths = None
+            if isinstance(recovered_paths, list) and recovered_paths:
+                test_paths = validate_safe_test_paths(recovered_paths)
+        if (
+            isinstance(stored_max_repair, int)
+            and not isinstance(stored_max_repair, bool)
+            and 0 <= stored_max_repair <= 100
+        ):
+            self.max_repair_attempts = stored_max_repair
+
+        # Validate task repository root
+        if stored_repo_root:
+            stored_path = Path(stored_repo_root).resolve()
+            if stored_path != self.repo_root:
+                if not (stored_path / ".git").exists():
+                    raise ValueError(f"Task stored repo root is invalid: {stored_repo_root}")
+
+        if not mock_mode:
+            can_start, budget_msg = self.budget_guard.check_can_start_new_task()
+            if not can_start:
+                self._save_task_state(task_id, "WAITING_APPROVAL", current_repair_attempts, budget_msg, mock_mode=mock_mode)
+                self._emit("status", agent="system", phase="budget", stage="blocked", error=budget_msg)
+                return ClosedLoopResult(
+                    task_id=task_id,
+                    success=False,
+                    state="WAITING_APPROVAL",
+                    result_summary=budget_msg,
+                    repair_attempts=current_repair_attempts,
+                )
 
         decision_note = notes or "Authorized by human operator"
         self._save_task_state(task_id, "REPAIRING", current_repair_attempts, mock_mode=mock_mode)
@@ -875,7 +1380,15 @@ class GeminiClosedLoopOrchestrator:
             output_snippet=f"Approved: {decision_note}",
             mock_mode=mock_mode,
         )
+        self._emit(
+            "status", agent="human", phase="approval", stage="approved",
+            decision="approved", notes=decision_note,
+        )
 
+        # From here onward, worktree creation, subprocesses or models may have
+        # observable effects even if cancellation or an exception interrupts us.
+        if resume_progress is not None:
+            resume_progress["effects_started"] = True
         if stored_worktree and Path(stored_worktree).exists():
             worktree = Path(stored_worktree).resolve()
         else:
@@ -886,8 +1399,53 @@ class GeminiClosedLoopOrchestrator:
             raise ValueError(f"Worktree has no git repository metadata: {worktree}")
 
         base_ref = await self.worktree_mgr.get_base_ref(worktree)
+
+        if current_repair_attempts >= self.max_repair_attempts:
+            exhausted_summary = (
+                f"Repair limit already exhausted ({current_repair_attempts}/{self.max_repair_attempts}); "
+                "approval cannot start another repair attempt."
+            )
+            self._save_task_state(task_id, "FAILED", current_repair_attempts, exhausted_summary, mock_mode=mock_mode)
+            self._emit("status", agent="system", phase="repair", stage="failed", error=exhausted_summary)
+            return ClosedLoopResult(
+                task_id=task_id,
+                success=False,
+                state="FAILED",
+                result_summary=exhausted_summary,
+                repair_attempts=current_repair_attempts,
+            )
+
+        task_changed_paths = await self.worktree_mgr.get_changed_paths_since(worktree, base_ref)
+        if not mock_mode and not allow_untrusted_tests:
+            untracked_paths = await self.worktree_mgr.get_changed_paths(worktree, include_ignored=True)
+            prior_untrusted = self._detect_modified_or_new_tests(
+                sorted(set(task_changed_paths) | set(untracked_paths))
+            )
+            if prior_untrusted:
+                error_msg = (
+                    f"Previously generated or modified test code requires explicit approval before execution: {prior_untrusted}. "
+                    "Re-approve with untrusted test execution enabled or revert the test changes."
+                )
+                self._save_task_state(task_id, "WAITING_APPROVAL", current_repair_attempts, error_msg, mock_mode=mock_mode)
+                self._log_step(task_id, "Sandbox Gate: Untrusted Test Code", "SECURITY", "Gate", "WAITING_APPROVAL", output_snippet=error_msg, mock_mode=mock_mode)
+                self._emit(
+                    "approval_required", phase="approval", reason=error_msg,
+                    tests=prior_untrusted,
+                )
+                return ClosedLoopResult(
+                    task_id=task_id,
+                    success=False,
+                    state="WAITING_APPROVAL",
+                    result_summary=error_msg,
+                    repair_attempts=current_repair_attempts,
+                )
+
         dev = dev_agent or self._new_dev_agent(mock_mode)
-        rev_choice = "deepseek" if reviewer_model_str and "deepseek" in reviewer_model_str.lower() else self.reviewer_choice
+        rev_choice = (
+            ("deepseek" if "deepseek" in reviewer_model_str.lower() else "glm")
+            if reviewer_model_str
+            else self.reviewer_choice
+        )
         reviewer = reviewer_agent or FlashReviewer(
             model_key=rev_choice,
             budget_cfg=self.policy.budget,
@@ -901,7 +1459,10 @@ class GeminiClosedLoopOrchestrator:
 
         try:
             while True:
-                self._save_task_state(task_id, "REPAIRING", repair_attempts=repair_attempts, mock_mode=mock_mode)
+                self._save_task_state(
+                    task_id, "REPAIRING", repair_attempts=repair_attempts,
+                    mock_mode=mock_mode, base_ref=base_ref,
+                )
                 self._log_step(
                     task_id,
                     f"Gemini Approved Repair Attempt #{repair_attempts}",
@@ -911,6 +1472,11 @@ class GeminiClosedLoopOrchestrator:
                     output_snippet=decision_note[:300],
                     mock_mode=mock_mode,
                 )
+                self._emit(
+                    "status", agent="gemini", phase="repair", stage="start",
+                    attempt=repair_attempts, approved=True,
+                    reason=decision_note[:2000],
+                )
 
                 repair_prompt = (
                     f"Requirement:\n{requirement}\n\n"
@@ -918,14 +1484,59 @@ class GeminiClosedLoopOrchestrator:
                     "Repair the code implementation to resolve the vulnerability or issue. "
                     "Ensure tests pass and satisfy all requirements."
                 )
-                repair_res = await dev.execute(repair_prompt, context={"worktree_path": worktree})
+
+                def approved_repair_line(stream: str, line: str) -> None:
+                    self._emit(
+                        "output", agent="gemini", phase="repair",
+                        stream=stream, text=line, attempt=repair_attempts, approved=True,
+                    )
+
+                repair_res = await dev.execute(
+                    repair_prompt,
+                    context={"worktree_path": worktree, "repo_root": str(self.repo_root), "on_line": approved_repair_line},
+                )
+                self._record_usage(
+                    task_id,
+                    agent="gemini",
+                    model=dev.model_name,
+                    prompt_tokens=repair_res.prompt_tokens,
+                    completion_tokens=repair_res.completion_tokens,
+                    cost_cny=repair_res.cost_cny,
+                    duration_s=repair_res.duration_s,
+                    mock_mode=mock_mode,
+                )
+                self._emit_policy_rejections(repair_res, phase="repair", attempt=repair_attempts)
                 if not repair_res.success:
                     error_msg = f"Gemini approved repair #{repair_attempts} failed: {repair_res.error}"
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    self._emit(
+                        "status", agent="gemini", phase="repair", stage="failed",
+                        attempt=repair_attempts, error=error_msg,
+                    )
                     return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
                 repair_files = repair_res.metadata.get("files_written", [])
+                observed_paths = await self.worktree_mgr.get_changed_paths(worktree)
+                ignored_paths = await self.worktree_mgr.get_changed_paths(worktree, include_ignored=True)
+                repair_files = sorted(set(repair_files) | set(observed_paths))
                 native_tools = repair_res.metadata.get("native_tool_steps", [])
+                for step in native_tools:
+                    if not isinstance(step, dict):
+                        continue
+                    payload = {
+                        "name": step.get("name"),
+                        "succeeded": step.get("succeeded"),
+                        "parameters": step.get("parameters") or {},
+                        "attempt": repair_attempts,
+                    }
+                    self._emit("tool_call", agent="gemini", phase="repair", **payload)
+                    self._emit("tool_result", agent="gemini", phase="repair", **payload)
+                self._emit(
+                    "status", agent="gemini", phase="repair", stage="complete",
+                    attempt=repair_attempts, files_written=repair_files,
+                    tool_steps=len(native_tools), duration_s=repair_res.duration_s,
+                    approved=True,
+                )
                 has_write = any(
                     item.get("name") in ("write_to_file", "replace_file_content") and item.get("succeeded")
                     for item in native_tools
@@ -941,6 +1552,23 @@ class GeminiClosedLoopOrchestrator:
                     self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
                     return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
+                post_dev_paths = await self.worktree_mgr.get_changed_paths_since(worktree, base_ref)
+                untrusted_tests = self._detect_modified_or_new_tests(
+                    sorted(set(repair_files) | set(ignored_paths) | set(post_dev_paths))
+                )
+                if untrusted_tests and not allow_untrusted_tests and not mock_mode:
+                    error_msg = (
+                        f"Untrusted test code generated or modified during approved repair: {untrusted_tests}. "
+                        "Aborting before execution."
+                    )
+                    self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode)
+                    self._log_step(task_id, "Sandbox Gate: Untrusted Test Code", "SECURITY", "Gate", "FAILED", error_snippet=error_msg, mock_mode=mock_mode)
+                    self._emit(
+                        "status", agent="system", phase="repair", stage="failed",
+                        attempt=repair_attempts, error=error_msg,
+                    )
+                    return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
+
                 checkpoint_sha = await self.worktree_mgr.commit_checkpoint(
                     worktree, f"fix: gemini approved repair attempt #{repair_attempts}"
                 )
@@ -952,9 +1580,32 @@ class GeminiClosedLoopOrchestrator:
                 head_before = await self.worktree_mgr.get_head_sha(worktree)
                 tree_before = await self.worktree_mgr.get_tree_hash(worktree, checkpoint_sha)
 
-                repair_paths = self._test_paths(worktree, repair_files) or (validate_safe_test_paths(test_paths, worktree) if test_paths else None)
+                repair_paths = (validate_safe_test_paths(test_paths, worktree) if test_paths else None) or self._test_paths(worktree, repair_files)
                 runner = TestRunner(worktree, test_paths=repair_paths or None)
-                test_res = await runner.run(timeout=self.policy.execution.timeout_seconds)
+                self._save_task_state(
+                    task_id, "TESTING", repair_attempts=repair_attempts, mock_mode=mock_mode,
+                    commit_sha=checkpoint_sha, base_ref=base_ref,
+                )
+
+                def approved_test_line(line: str, stream: str) -> None:
+                    self._emit(
+                        "test_line", agent="pytest", phase="repair-test",
+                        stream=stream, line=line, attempt=repair_attempts, approved=True,
+                    )
+
+                self._emit(
+                    "status", agent="pytest", phase="repair-test", stage="start",
+                    attempt=repair_attempts, targets=repair_paths, approved=True,
+                )
+                test_res = await runner.run(timeout=self.policy.execution.timeout_seconds, on_line=approved_test_line)
+                self._emit(
+                    "status", agent="pytest", phase="repair-test", stage="complete",
+                    attempt=repair_attempts, passed=test_res.passed,
+                    total=getattr(test_res, "total_tests", 0),
+                    failed=getattr(test_res, "failed_tests", 0),
+                    duration_s=getattr(test_res, "duration_s", 0.0),
+                    summary=getattr(test_res, "summary", ""),
+                )
 
                 is_clean = await self.worktree_mgr.is_clean(worktree)
                 head_after = await self.worktree_mgr.get_head_sha(worktree)
@@ -982,11 +1633,22 @@ class GeminiClosedLoopOrchestrator:
                     tree_hash=tree_before,
                     evidence_id=str(uuid.uuid4())[:8],
                 )
+                self._emit(
+                    "diff", phase="diff", attempt=repair_attempts, approved=True,
+                    commit_sha=checkpoint_sha, base_ref=base_ref,
+                    generated_files=repair_files, patch=diff,
+                )
 
                 if not latest_artifacts.test_passed:
                     rejection_reason = f"Local tests failed after repair #{repair_attempts}:\n{latest_artifacts.test_summary}"
                 else:
                     self._save_task_state(task_id, "REVIEWING", repair_attempts=repair_attempts, mock_mode=mock_mode, commit_sha=latest_artifacts.commit_sha, test_passed=latest_artifacts.test_passed)
+                    self._emit(
+                        "status", agent=reviewer.model_key, phase="review", stage="start",
+                        model=reviewer.model_name, commit_sha=latest_artifacts.commit_sha,
+                        diff_lines=len(diff.splitlines()), test_passed=latest_artifacts.test_passed,
+                        attempt=repair_attempts, approved=True,
+                    )
                     review_prompt = "Review requirements, code implementation, and actual test evidence after authorized repair."
                     review_context = {
                         "requirement": requirement,
@@ -1010,10 +1672,25 @@ class GeminiClosedLoopOrchestrator:
                         review_res.completion_tokens or 0,
                         cost_cny=actual_cost,
                     )
+                    self._record_usage(
+                        task_id,
+                        agent=reviewer.model_key,
+                        model=reviewer.model_name,
+                        prompt_tokens=review_res.prompt_tokens,
+                        completion_tokens=review_res.completion_tokens,
+                        cost_cny=actual_cost,
+                        duration_s=review_res.duration_s,
+                        mock_mode=mock_mode,
+                        persist_task=False,
+                    )
 
                     if not review_res.success:
                         error_msg = f"Independent review failed: {review_res.error}"
                         self._save_task_state(task_id, "FAILED", repair_attempts, error_msg, mock_mode=mock_mode, commit_sha=latest_artifacts.commit_sha)
+                        self._emit(
+                            "status", agent=reviewer.model_key, phase="review", stage="failed",
+                            error=error_msg,
+                        )
                         return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=error_msg, repair_attempts=repair_attempts)
 
                     raw_verdict = review_res.metadata.get("review") or {}
@@ -1038,6 +1715,11 @@ class GeminiClosedLoopOrchestrator:
                         cost_cny=review_res.cost_cny,
                         mock_mode=mock_mode,
                     )
+                    self._emit(
+                        "output", agent=reviewer.model_key, phase="review",
+                        verdict=asdict(latest_verdict), text=latest_verdict.summary,
+                        approved=True,
+                    )
 
                     history.append({
                         "attempt": repair_attempts,
@@ -1055,6 +1737,7 @@ class GeminiClosedLoopOrchestrator:
                             task_id, "SUCCESS", repair_attempts, success_summary,
                             mock_mode=mock_mode, commit_sha=latest_artifacts.commit_sha,
                             reviewer_model=reviewer.model_name, test_passed=latest_artifacts.test_passed,
+                            base_ref=base_ref,
                         )
                         return ClosedLoopResult(
                             task_id=task_id,
@@ -1077,6 +1760,12 @@ class GeminiClosedLoopOrchestrator:
                             task_id, "WAITING_APPROVAL", repair_attempts, p0_summary,
                             mock_mode=mock_mode, commit_sha=latest_artifacts.commit_sha,
                             reviewer_model=reviewer.model_name, test_passed=latest_artifacts.test_passed,
+                            base_ref=base_ref,
+                        )
+                        self._emit(
+                            "approval_required", phase="approval", reason=p0_summary,
+                            severity=latest_verdict.severity, commit_sha=latest_artifacts.commit_sha,
+                            verdict=asdict(latest_verdict), attempt=repair_attempts,
                         )
                         return ClosedLoopResult(
                             task_id=task_id,
@@ -1122,5 +1811,11 @@ class GeminiClosedLoopOrchestrator:
         except Exception as exc:
             logger.exception("Unexpected error during resume_after_approval: %s", exc)
             err_msg = f"Fatal execution exception during resume: {exc}"
+            try:
+                if "worktree" in locals() and worktree:
+                    probe = await self.worktree_mgr.probe_worktree_status(worktree, base_ref=base_ref if "base_ref" in locals() else None)
+                    err_msg = f"{err_msg} | Worktree probe: {probe.summary}"
+            except Exception:
+                pass
             self._save_task_state(task_id, "FAILED", repair_attempts, err_msg, mock_mode=mock_mode)
             return ClosedLoopResult(task_id=task_id, success=False, state="FAILED", result_summary=err_msg, repair_attempts=repair_attempts)
