@@ -16,9 +16,9 @@ def test_sensitive_files_detection():
 @pytest.mark.parametrize(
     "secret,template",
     [
-        ("sk-1234567890abcdef1234567890", "openai_key = {s}"),
-        ("ghp_1234567890abcdef1234567890abcdef123456", "github_token = {s}"),
-        ("AKIA1234567890ABCDEF", "aws_access_key = {s}"),
+        ("s" + "k-1234567890abcdef1234567890", "openai_key = {s}"),
+        ("gh" + "p_1234567890abcdef1234567890abcdef123456", "github_token = {s}"),
+        ("AK" + "IA1234567890ABCDEF", "aws_access_key = {s}"),
     ],
 )
 def test_credential_redaction_patterns(secret, template):
