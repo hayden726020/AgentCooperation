@@ -37,3 +37,8 @@ def test_evidence_truncation_when_exceeding_limit():
     truncated = redact_and_truncate_evidence(long_content, max_chars=limit)
     assert len(truncated) < len(long_content)
     assert "[TRUNCATED" in truncated
+    # Verify the body length before the truncation marker strictly respects max_chars limit
+    body = truncated.split("\n... [TRUNCATED")[0]
+    assert len(body) <= limit
+    # Verify overall output length is bounded by limit plus marker metadata
+    assert len(truncated) <= limit + 100
